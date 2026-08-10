@@ -18,6 +18,18 @@ The same JS file also provides a second, optional card,
 dashboard. It reads the same tasks and the same history as the main card and
 needs no config of its own. See [Week calendar card](#week-calendar-card).
 
+<p align="center">
+  <img src="images/tasks.png" alt="Tasks view: pinned irrigation log, an Upcoming section with due dates and application windows, an Activity section, and collapsed Optional / Season finished sections" width="410">
+  &nbsp;
+  <img src="images/year-history.png" alt="Year History view: every logged event for the year, grouped by month, newest first, each with its own colour" width="410">
+</p>
+
+<p align="center">
+  <em>Tasks (left) and Year History (right) — real data from a live install.</em>
+</p>
+
+![The week calendar card: a Monday-to-Sunday strip with today highlighted, showing logged events and upcoming due dates](images/week-calendar.png)
+
 **Requirements:** Home Assistant with the
 [pyscript](https://github.com/custom-components/pyscript) integration (see
 [Installation](#installation)). Developed and run against Home Assistant
@@ -799,6 +811,8 @@ same post-write refresh path (see "How DONE TODAY / ADD APPLICATION work")
 (one resource, two cards). It shows one calendar week, Monday to Sunday: what
 was actually logged up to and including today, and what is coming up for the
 rest of the week.
+
+![Week calendar showing Monday to Sunday with today highlighted](images/week-calendar.png)
 
 ```yaml
 type: custom:lawn-week-calendar
