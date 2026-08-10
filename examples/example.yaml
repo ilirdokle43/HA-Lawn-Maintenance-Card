@@ -1,0 +1,285 @@
+# Example Lovelace card config for lawn-maintenance-card.
+# Add this as a card in a dashboard (YAML mode, or via "Manual card" > paste YAML).
+#
+# Requirements before this works:
+#   1. pyscript integration installed (HACS) and enabled in configuration.yaml:
+#        pyscript: {}
+#   2. pyscript/lawn_maintenance.py from this repo copied to <config>/pyscript/
+#   3. lawn-maintenance-card.js added as a Lovelace JS module resource
+#
+# No input_helpers needed — history is created automatically the first time
+# you press DONE TODAY / SKIP THIS YEAR for a task.
+
+type: custom:lawn-maintenance-card
+title: LAWN MAINTENANCE
+show_overview: true
+tasks:
+  # --- Recurring seasonal tasks ---------------------------------------
+
+  - id: fungicide
+    name: Fungicide
+    type: recurring
+    icon: mdi:spray
+    active_months: [5, 6, 7, 8, 9]
+    interval_days: 21
+    due_soon_days: 3
+    # products: (instead of a single product/application_rate) tracks which
+    # product was used per application and suggests rotating away from the
+    # last resistance/mode-of-action group — see "Product rotation" in the
+    # README. Each product needs its own `id` (stored per history entry).
+    products:
+      - id: propiconazole
+        name: "Quali-Pro Propiconazole 14.3"
+        active_ingredient: "Propiconazole 14.3%"
+        group: 3
+      - id: azoxystrobin
+        name: "Azoxy 2SC Select"
+        active_ingredient: "Azoxystrobin 22.9%"
+        group: 11
+    description: "Preventive summer fungicide program"
+    notes: "Rotate fungicide groups rather than repeatedly using the same mode of action"
+
+  - id: fertilizer
+    name: Fertilizer
+    type: recurring
+    icon: mdi:grain
+    active_months: [4, 5, 6, 7, 8, 9, 10]
+    interval_days: 42
+    product: "Example balanced fertilizer 20-5-10"
+    application_rate: "1 kg / 100 m²"
+    notes: "Water in thoroughly after application"
+
+  - id: iron
+    name: Iron
+    type: recurring
+    icon: mdi:atom
+    active_months: [4, 5, 6, 7, 8, 9]
+    interval_days: 14
+    product: "Chelated iron supplement"
+    notes: "Greens up the lawn without a growth flush"
+
+  - id: wetting_agent
+    name: Wetting agent
+    type: recurring
+    icon: mdi:water-outline
+    active_months: [6, 7, 8]
+    interval_days: 30
+    description: "Helps water penetrate dry/hydrophobic soil in peak summer"
+
+  # --- Seasonal application-window tasks -------------------------------
+
+  - id: tenacity
+    name: Tenacity
+    type: seasonal
+    icon: mdi:flower-pollen
+    window:
+      start: "02-15"
+      end: "03-15"
+    upcoming_days: 21
+    ending_soon_days: 5
+    product: "Tenacity herbicide (mesotrione)"
+    application_rate: "8 ml / 10 L + surfactant"
+    notes: "Apply before crabgrass/weed germination; avoid mowing 3 days before/after"
+
+  - id: aeration
+    name: Aeration
+    type: seasonal
+    icon: mdi:dots-grid
+    window:
+      start: "09-01"
+      end: "09-30"
+    description: "Core aeration to relieve soil compaction before overseeding"
+
+  - id: overseeding
+    name: Overseeding
+    type: seasonal
+    icon: mdi:seed-outline
+    window:
+      start: "09-05"
+      end: "09-25"
+    notes: "Do shortly after aeration for best seed-to-soil contact"
+
+  - id: autumn_fertilizer
+    name: Autumn fertilizer
+    type: seasonal
+    icon: mdi:leaf
+    window:
+      start: "10-01"
+      end: "10-31"
+    product: "Winterizer fertilizer 10-0-20"
+    notes: "Builds root reserves for winter"
+
+  # --- Optional tasks ---------------------------------------------------
+  # optional: true tasks are tracked (history, Add Application, Done Today,
+  # Year Overview) but never generate an overdue/missed warning — see the
+  # "Optional tasks" section of the README.
+
+  - id: nitrogen_boost
+    name: Nitrogen boost
+    type: seasonal
+    optional: true
+    icon: mdi:leaf-circle
+    window:
+      start: "03-01"
+      end: "05-31"
+    product: "34-0-0"
+    description: "Optional high-nitrogen treatment when additional nitrogen is needed"
+    notes: "Use only when extra nitrogen is needed. Avoid during summer heat."
+
+  # --- Water-in examples -------------------------------------------------
+  # water_in (true/false) + water_in_note are purely informational: shown as
+  # a "Water in" row in the expanded details and in the log-application
+  # form, never affecting status/history. Set at task level, product level
+  # (each product in `products:` can override the task's setting), or both —
+  # see "Water-in instructions" in the README.
+
+  - id: fertilizer_example
+    name: Fertilizer
+    type: seasonal
+    window:
+      start: "03-15"
+      end: "04-15"
+    product: "12-12-17"
+    application_rate: "2.5 kg / 100 m²"
+    water_in: true
+    water_in_note: "Water thoroughly after application"
+
+  - id: fungicide_example
+    name: Fungicide
+    type: recurring
+    active_months: [5, 6, 7, 8, 9]
+    interval_days: 21
+    products:
+      - id: product_a
+        name: "Example Product A"
+        group: 3
+        water_in: false
+        water_in_note: "Allow treatment to dry on foliage"
+      - id: product_b
+        name: "Example Product B"
+        group: 11
+        water_in: false
+        water_in_note: "Allow treatment to dry on foliage"
+
+  # --- Sensor advisory example --------------------------------------------
+  # advisory: reads a numeric HA sensor and shows an informational
+  # recommendation (never an automatic command, never affects status/
+  # section/history) when a condition is met — see "Sensor advisories" in
+  # the README. Works with any numeric sensor: soil moisture, temperature,
+  # humidity, rain, salinity, conductivity, etc. `below`/`above` — exactly
+  # one is required. `duration_hours` (optional) requires the condition to
+  # have held continuously for that long, checked against HA's own recorder
+  # history — omit it to just evaluate the current reading.
+
+  - id: summer_light_fertilizer
+    name: Summer light fertilizer
+    type: recurring
+    optional: true
+    icon: mdi:grain
+    active_months:
+      - 6
+      - 7
+      - 8
+    interval_days: 30
+    product: "12-12-17"
+    application_rate: "1.0 kg / 100 m²"
+    water_in: true
+    water_in_note: "Water thoroughly after application."
+    advisory:
+      entity: sensor.lawn_conductivity
+      below: 200
+      duration_hours: 48
+      message: "Consider light feeding"
+      clear_message: "EC level is currently acceptable"
+    description: "Light summer feeding when soil EC remains persistently low"
+
+  # --- Log task example ---------------------------------------------------
+  # type: log is for anything you just want to record and see "last done
+  # <date>" for — no season, no interval, never overdue/Needs Attention.
+  # Nothing here is mowing-specific: action_label/value_label/task name
+  # carry all the wording, so the same type works for blade sharpening, a
+  # soil test, a sprinkler inspection, etc. entry_fields records a
+  # structured value with EACH history entry (not just a static display) —
+  # MOWED TODAY silently uses `default`, no prompt (one-tap quick action);
+  # ADD MOWING (a deliberate backdated entry) and editing a past entry both
+  # get a bounded dropdown to set/correct that entry's value.
+  # See "Log tasks" in the README.
+
+  - id: mowing
+    name: Mowing
+    type: log
+    icon: mdi:content-cut
+    pinned: true
+    action_label: MOWED TODAY
+    add_action_label: ADD MOWING
+    value_label: Last mowed
+    history_label: Mowing history
+    target_interval_days: 5
+    show_in_overview: false
+    entry_fields:
+      - id: height
+        label: Mowing height
+        type: number
+        unit: cm
+        default: 6
+        min: 1
+        max: 10
+        step: 1
+    description: "Record every lawn mowing"
+
+  # --- Photo attachment example -------------------------------------------
+  # allow_photo: true adds an optional photo picker to the log/add form and
+  # shows a thumbnail on that entry in both the Tasks tab and Year History
+  # (tap it for a full-size lightbox). The photo is always optional — you
+  # can still log without one. Because picking a photo needs interaction,
+  # LOG CONDITION opens the form instead of instant-logging (tasks without
+  # allow_photo keep their one-tap behavior). The browser downscales to a
+  # 1800 px long edge before upload; Home Assistant's built-in image_upload
+  # integration stores the file and the history entry keeps only its id.
+  # Generic — works on any task type, not just type: log.
+  # NOTE: image URLs are NOT authentication-protected — see "Photo
+  # attachments" in the README before storing anything sensitive.
+
+  - id: lawn_condition
+    name: Lawn condition
+    type: log
+    icon: mdi:grass
+    pinned: false
+    action_label: LOG CONDITION
+    add_action_label: ADD CONDITION
+    value_label: Last observation
+    history_label: Lawn condition history
+    show_in_overview: false
+    allow_photo: true
+    entry_fields:
+      - id: condition
+        label: Condition
+        type: text
+        default: Good
+    description: "Record the overall condition of the lawn"
+
+# ==========================================================================
+# SECOND CARD — custom:lawn-week-calendar
+# ==========================================================================
+# The same JS resource also registers a read-only 7-day (Mon–Sun) strip meant
+# for the top of a dashboard. Add it as its OWN card, anywhere on the same
+# dashboard as the lawn-maintenance-card above:
+#
+#   type: custom:lawn-week-calendar
+#
+# That is the whole config. It deliberately takes no `tasks:` of its own —
+# it reads the task list out of the lawn-maintenance-card already on the
+# dashboard and the history out of the same pyscript.lawn_<id> entities, so
+# there is only one copy of the YAML above to maintain.
+#
+# Optional keys:
+#   title: LAWN WEEK              # heading above the strip
+#   source_dashboard: dashboard-x # only if the maintenance card is on a
+#                                 # DIFFERENT dashboard (its URL path)
+#   tasks: [...]                  # escape hatch for a standalone install
+#                                 # with no maintenance card anywhere; using
+#                                 # it means maintaining two copies
+#
+# All 7 days fit at roughly 790px and up. HA's sections view uses ~400px
+# columns, so give the section a wider column_span if you want the full week
+# visible on desktop; narrower cards scroll/swipe (~2 days on a phone).

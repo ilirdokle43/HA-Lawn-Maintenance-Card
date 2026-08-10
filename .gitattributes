@@ -1,0 +1,2 @@
+# Keep line endings deterministic for everyone, including HACS downloads.
+* text=auto eol=lf
