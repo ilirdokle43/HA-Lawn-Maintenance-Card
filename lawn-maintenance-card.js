@@ -91,6 +91,24 @@ function windowDates(window, startYear) {
   return { start, end };
 }
 
+// First active month strictly after today's month, within the SAME calendar
+// year — the "does this task come back before the year is out?" question that
+// separates an optional recurring task's Inactive (yes, it returns) from
+// Season finished (no, that's it for this year). Returns the month number
+// (1-12), or null when nothing is left this year.
+//
+// Deliberately does NOT wrap into next year, unlike nextActiveMonth() below:
+// wrapping would make every task "resuming" forever and Season finished
+// unreachable. A season that spans New Year (active_months [11, 12, 1, 2])
+// still behaves sensibly — viewed in June it reports 11, and by the time
+// December arrives that month is itself active, so the task is in Optional
+// rather than needing a resume date at all.
+function nextActiveMonthThisYear(activeMonths, today) {
+  const currentMonth = today.getMonth() + 1;
+  const later = activeMonths.filter((m) => m > currentMonth);
+  return later.length ? Math.min(...later) : null;
+}
+
 function nextActiveMonth(activeMonths, today) {
   for (let i = 1; i <= 12; i++) {
     const m = ((today.getMonth() + i) % 12) + 1;
@@ -113,6 +131,12 @@ function escapeHtml(str) {
 // color/icon plus which of the five priority sections it belongs in and its
 // sort rank within that section (lower = more urgent, shown first).
 // ---------------------------------------------------------------------------
+
+// How far ahead a task has to be before it stops being "coming up" and gets
+// parked in Inactive instead. Applies to a seasonal task's window start; see
+// computeSeasonalStatus and the note on optional recurring tasks in
+// applyOptionalRemap.
+const INACTIVE_THRESHOLD_DAYS = 30;
 
 const SECTION_ORDER = ["needs_attention", "upcoming", "logs", "optional", "season_finished", "inactive"];
 const SECTION_LABELS = {
@@ -144,6 +168,11 @@ const STATUS_META = {
   completed: { color: "#10b981", icon: "mdi:check-circle", section: "season_finished", rank: 1 },
   skipped: { color: "#9ca3af", icon: "mdi:cancel", section: "season_finished", rank: 2 },
   inactive: { color: "#9ca3af", icon: "mdi:moon-waning-crescent", section: "inactive", rank: 0 },
+  // Seasonal window further out than INACTIVE_THRESHOLD_DAYS. Shares rank 0
+  // with every other Inactive key on purpose: with ranks equal, _renderTasks'
+  // tie-break sorts the whole section by secondaryTime, i.e. chronologically
+  // by when each task comes back (see secondaryTime).
+  season_inactive: { color: "#9ca3af", icon: "mdi:calendar-arrow-right", section: "inactive", rank: 0 },
   // Optional tasks (task.optional: true) never compute overdue/missed —
   // computeRecurringStatus/computeSeasonalStatus run normally for the date
   // math, then applyOptionalRemap() maps their result onto these calm,
@@ -152,11 +181,26 @@ const STATUS_META = {
   optional_available: { color: "#a78bfa", icon: "mdi:leaf-circle-outline", section: "optional", rank: 0 },
   optional_upcoming: { color: "#a78bfa", icon: "mdi:calendar-clock-outline", section: "optional", rank: 1 },
   optional_finished: { color: "#a78bfa", icon: "mdi:calendar-blank-outline", section: "optional", rank: 2 },
+  // Optional recurring, out of season but returning later this year — its own
+  // key so it can carry the calm optional purple into the Inactive section
+  // while mandatory tasks there keep the grey "inactive" styling. Rank 0 like
+  // the other Inactive keys, so the section sorts purely chronologically.
+  optional_inactive: { color: "#a78bfa", icon: "mdi:moon-waning-crescent", section: "inactive", rank: 0 },
+  // Optional recurring with no active months left this calendar year — done
+  // for the year, so it joins the seasonal tasks in Season finished.
+  optional_season_over: { color: "#a78bfa", icon: "mdi:calendar-blank-outline", section: "season_finished", rank: 3 },
   // type: log tasks (see computeLogStatus) — a single calm status regardless
   // of how long ago the last entry was. Never overdue/alarming by design;
   // any "may be due" nudge from target_interval_days is conveyed in the
   // row/detail text, not through color.
   log: { color: "#3b82f6", icon: "mdi:calendar-check-outline", section: "logs", rank: 0 },
+  // type: treatment — on-demand, never due, never overdue. Sits with the other
+  // "record it when it happens" rows rather than in a scheduled section.
+  treatment: { color: "#3b82f6", icon: "mdi:beaker-outline", section: "logs", rank: 1 },
+  // A follow-up that is satisfied (or whose parent has never been done) is
+  // simply not rendered — see _renderTasks. The entry exists so the section
+  // lookup can never fall through to the "inactive" default.
+  follow_up_done: { color: "#10b981", icon: "mdi:check-circle", section: "season_finished", rank: 4 },
 };
 
 // Maps a normally-computed seasonal statusKey onto its optional-task
@@ -175,7 +219,12 @@ const OPTIONAL_SEASONAL_REMAP = {
 // optional remap intentionally hides a due date that no longer means
 // "you must do this" (optional_available/optional_finished). optional_upcoming
 // keeps showing its date ("next in N days") since that's still informative.
-const HIDE_NEXT_DUE_STATUS_KEYS = new Set(["inactive", "optional_available", "optional_finished"]);
+const HIDE_NEXT_DUE_STATUS_KEYS = new Set([
+  "inactive", "optional_available", "optional_finished",
+  // Same reasoning as plain "inactive" — an out-of-season date isn't a real
+  // recommendation, and the row already says when the task comes back.
+  "optional_inactive", "optional_season_over",
+]);
 
 // Builds the label for a suspended/inactive recurring task, e.g.
 // "Inactive · resumes September" (or "· resumes January 2027" if the next
@@ -189,7 +238,13 @@ function inactiveLabel(activeMonths, fromDate, today) {
 
 function computeRecurringStatus(task, data, today) {
   const activeMonths = task.active_months || [];
-  const inSeasonNow = activeMonths.includes(today.getMonth() + 1);
+  // No active_months configured means "no season restriction", i.e. active
+  // all year — the reading a year-round task like a monthly treatment needs.
+  // (It previously meant the opposite by accident: an empty list matched no
+  // month, so such a task was permanently Inactive and could never come due.
+  // Every task that configures active_months is unaffected either way.)
+  const hasSeason = activeMonths.length > 0;
+  const inSeasonNow = !hasSeason || activeMonths.includes(today.getMonth() + 1);
   const last = data.h.length ? parseISODate(data.h[0]) : null;
 
   const overridden = !!data.override;
@@ -206,7 +261,7 @@ function computeRecurringStatus(task, data, today) {
   // configured season is not a real recommendation — interval math alone
   // can walk a date straight into an inactive gap (e.g. spring+fall active,
   // summer off). Season state always wins over the interval calculation.
-  const seasonSuspended = !!nextDue && !activeMonths.includes(nextDue.getMonth() + 1);
+  const seasonSuspended = hasSeason && !!nextDue && !activeMonths.includes(nextDue.getMonth() + 1);
 
   if (!inSeasonNow || seasonSuspended) {
     // If today itself is inactive, resume-search from today. If today is
@@ -214,26 +269,36 @@ function computeRecurringStatus(task, data, today) {
     // search from that date instead (it's the more relevant reference).
     const resumeFrom = inSeasonNow && seasonSuspended ? nextDue : today;
     const label = inactiveLabel(activeMonths, resumeFrom, today);
-    return { ...base, statusKey: "inactive", label, detail: "" };
+    // First day of the month this task becomes live again. Purely a sort key
+    // for the Inactive section (see secondaryTime) — the label above is still
+    // what the row displays, and a task with no active_months has no resume
+    // date, so it stays null and sorts as before.
+    const resumes = nextActiveMonth(activeMonths, resumeFrom);
+    const resumesAt = resumes ? new Date(resumes.year, resumes.month - 1, 1) : null;
+    return { ...base, statusKey: "inactive", label, detail: "", resumesAt };
   }
 
   if (!nextDue) {
     return { ...base, statusKey: "recommended_now", label: "Recommended now", detail: "Never completed" };
   }
 
-  const diff = daysBetween(today, nextDue);
-  const dueSoonDays = task.due_soon_days ?? 3;
+  return { ...base, ...dueDateStatus(nextDue, today, task.due_soon_days ?? 3, suffix), detail: "" };
+}
 
+// "How urgent is this date?" — the shared countdown wording used by both
+// recurring tasks and follow-ups (see computeFollowUpStatus), so a follow-up
+// counts down in exactly the same language and colours as everything else:
+// Due in N days -> Due tomorrow -> Due today -> Overdue by N days.
+function dueDateStatus(dueDate, today, dueSoonDays, suffix = "") {
+  const diff = daysBetween(today, dueDate);
   if (diff < 0) {
     const n = -diff;
-    return { ...base, statusKey: "overdue", label: `Overdue by ${n} day${n === 1 ? "" : "s"}${suffix}`, detail: "" };
+    return { statusKey: "overdue", label: `Overdue by ${n} day${n === 1 ? "" : "s"}${suffix}` };
   }
-  if (diff === 0) return { ...base, statusKey: "due_today", label: `Due today${suffix}`, detail: "" };
-  if (diff === 1) {
-    return { ...base, statusKey: dueSoonDays >= 1 ? "due_soon" : "upcoming", label: `Due tomorrow${suffix}`, detail: "" };
-  }
-  if (diff <= dueSoonDays) return { ...base, statusKey: "due_soon", label: `Due in ${diff} days${suffix}`, detail: "" };
-  return { ...base, statusKey: "upcoming", label: `Due in ${diff} days${suffix}`, detail: "" };
+  if (diff === 0) return { statusKey: "due_today", label: `Due today${suffix}` };
+  if (diff === 1) return { statusKey: dueSoonDays >= 1 ? "due_soon" : "upcoming", label: `Due tomorrow${suffix}` };
+  if (diff <= dueSoonDays) return { statusKey: "due_soon", label: `Due in ${diff} days${suffix}` };
+  return { statusKey: "upcoming", label: `Due in ${diff} days${suffix}` };
 }
 
 function currentWindowOccurrence(window, today) {
@@ -273,7 +338,13 @@ function computeSeasonalStatus(task, data, today) {
     label = `Completed for ${occYear}`;
   } else if (today < occ.start) {
     const daysUntil = daysBetween(today, occ.start);
-    if (daysUntil <= upcomingDays) {
+    if (daysUntil > INACTIVE_THRESHOLD_DAYS) {
+      // Too far out to be worth a slot in Upcoming — parked in Inactive until
+      // it comes within the horizon, at which point the two branches below
+      // take over again unchanged.
+      statusKey = "season_inactive";
+      label = `Inactive · starts ${formatShort(occ.start)}`;
+    } else if (daysUntil <= upcomingDays) {
       statusKey = "window_upcoming";
       label = `Upcoming — opens in ${daysUntil} day${daysUntil === 1 ? "" : "s"}`;
     } else {
@@ -315,6 +386,313 @@ function computeLogStatus(task, data, today) {
   const daysSince = last ? daysBetween(last, today) : null;
   const label = last === null ? "Never logged" : relativeDayLabel(daysSince);
   return { statusKey: "log", last, daysSince, label, detail: "" };
+}
+
+// ---------------------------------------------------------------------------
+// type: program — a fixed set of scheduled applications per calendar year,
+// written either as an explicit list of month-day strings:
+//
+//   schedule_dates: ["MM-DD", "MM-DD", ...]
+//
+// or as an annual anchor plus a fixed step, when the dates are regular enough
+// that listing them would be noise (see generatedTargets):
+//
+//   schedule_start: "MM-DD"
+//   schedule_interval_days: N
+//   schedule_end: "MM-DD"          # optional, defaults to 31 December
+//
+// Both produce the same list of absolute dates for the year in question, and
+// everything downstream treats them identically. An anchored sequence is a
+// *schedule*, not a recurrence: its step runs from the anchor, never from what
+// was last logged, so a late completion cannot drag the following targets — the
+// distinction from `recurring`, which deliberately does count from the last
+// completion and is left untouched.
+//
+// Unlike `recurring` (an interval that never ends) or `seasonal` (one window),
+// a program has a KNOWN, FINITE number of applications whose dates never move.
+// Logging one late does not shift the rest — the targets are absolute — and
+// the program can never generate more applications than it declares. Nothing
+// here knows any particular date; it all comes from the task's own YAML.
+// ---------------------------------------------------------------------------
+
+function programTargets(schedule, year) {
+  return (schedule || [])
+    .map((md) => {
+      const { month, day } = parseMonthDay(md);
+      return new Date(year, month - 1, day);
+    })
+    .sort((a, b) => a - b);
+}
+
+// The second way to describe a programme: an annual anchor plus a fixed step,
+// instead of writing every date out by hand.
+//
+//   schedule_start: "02-16"        # the anchor, re-derived every year
+//   schedule_interval_days: 30     # step between targets
+//   schedule_end: "10-31"          # optional, defaults to 31 December
+//
+// The anchor is rebuilt from the year being viewed, so the sequence restarts on
+// the same calendar date every year and cannot accumulate drift — a target's
+// date is a pure function of (anchor, step, index), never of what was logged.
+// Real date arithmetic throughout (addDays walks the calendar), so February
+// length and leap years are handled by the platform rather than by arithmetic
+// on month numbers.
+function generatedTargets(task, year) {
+  const step = Number(task.schedule_interval_days);
+  if (!task.schedule_start || !Number.isFinite(step) || step < 1) return [];
+  const { month, day } = parseMonthDay(task.schedule_start);
+  const end = task.schedule_end
+    ? (() => {
+        const e = parseMonthDay(task.schedule_end);
+        return new Date(year, e.month - 1, e.day);
+      })()
+    : new Date(year, 11, 31);
+  const out = [];
+  let cursor = new Date(year, month - 1, day);
+  // The 366 cap is a runaway guard only — a step of 1 fills a whole year and
+  // nothing legitimate can exceed one target per day.
+  while (cursor <= end && out.length < 366) {
+    out.push(cursor);
+    cursor = addDays(cursor, step);
+  }
+  return out;
+}
+
+// A programme's targets for one year, however its schedule is written. Both
+// spellings produce the same plain list of dates, so every downstream consumer
+// — status, sections, the week calendar, Year Overview — is identical for the
+// two and neither needs to know which was used.
+function programTargetsFor(task, year) {
+  if (Array.isArray(task.schedule_dates) && task.schedule_dates.length) {
+    return programTargets(task.schedule_dates, year);
+  }
+  return generatedTargets(task, year);
+}
+
+function computeProgramStatus(task, data, today) {
+  const year = today.getFullYear();
+  const targets = programTargetsFor(task, year);
+  const last = data.h.length ? parseISODate(data.h[0]) : null;
+  const base = { last, targets, occurrenceYear: year };
+  if (!targets.length) {
+    return { ...base, statusKey: "inactive", label: "No schedule configured", detail: "", remainingIdx: [], currentIdx: null };
+  }
+
+  // Each of THIS year's applications counts toward the latest target on or
+  // before it (anything earlier in the year counts toward the first). That is
+  // what makes a late application satisfy the target it was meant for without
+  // consuming a later one: applied 3 May still fills the 1 May slot, and the
+  // next target stays 21 May rather than sliding to 23 May.
+  const satisfied = new Set();
+  for (const iso of data.h) {
+    const applied = parseISODate(iso);
+    if (applied.getFullYear() !== year) continue;
+    let idx = 0;
+    for (let i = 0; i < targets.length; i++) if (targets[i] <= applied) idx = i;
+    satisfied.add(idx);
+  }
+  const appliedCount = satisfied.size;
+  const lastSatisfied = satisfied.size ? Math.max(...satisfied) : -1;
+
+  // Only targets after the newest satisfied one are still outstanding —
+  // anything skipped before it is simply missed, never a growing backlog.
+  const remainingIdx = [];
+  for (let i = lastSatisfied + 1; i < targets.length; i++) if (!satisfied.has(i)) remainingIdx.push(i);
+  let missedCount = 0;
+  for (let i = 0; i < lastSatisfied; i++) if (!satisfied.has(i)) missedCount++;
+
+  // Of the outstanding targets whose date has already passed, only the most
+  // recent one is shown as actionable; earlier ones are counted as missed.
+  const passed = remainingIdx.filter((i) => targets[i] <= today);
+  let currentIdx = null;
+  if (passed.length) {
+    currentIdx = passed[passed.length - 1];
+    missedCount += passed.length - 1;
+  } else if (remainingIdx.length) {
+    currentIdx = remainingIdx[0];
+  }
+
+  const detail = `${appliedCount} of ${targets.length} applied in ${year}` + (missedCount ? ` · ${missedCount} missed` : "");
+  const shared = { ...base, appliedCount, missedCount, remainingIdx, currentIdx, satisfiedIdx: [...satisfied].sort((a, b) => a - b) };
+
+  // Past the final target, the programme is done for the year regardless of
+  // how many were actually applied — it must not nag into the autumn — and
+  // next January's targets start the cycle again on their own.
+  if (currentIdx === null || today > targets[targets.length - 1]) {
+    return {
+      ...shared,
+      remainingIdx: [],
+      currentIdx: null,
+      statusKey: "completed",
+      label: `Season finished — ${appliedCount} of ${targets.length} applied`,
+      detail,
+    };
+  }
+
+  const nextDue = targets[currentIdx];
+  if (daysBetween(today, nextDue) > INACTIVE_THRESHOLD_DAYS) {
+    return { ...shared, nextDue, statusKey: "season_inactive", label: `Inactive · starts ${formatShort(nextDue)}`, detail };
+  }
+  return { ...shared, nextDue, ...dueDateStatus(nextDue, today, task.due_soon_days ?? 3), detail };
+}
+
+// type: treatment — an on-demand action with NO schedule of its own. Unlike
+// `recurring` it never computes a next-due date and can never become overdue:
+// it is performed when the user decides it's warranted, not because an
+// interval elapsed. Unlike `log` it is a deliberate treatment that can carry
+// products, entry_fields and follow-ups (see below), which is the whole point
+// — the schedule that matters is the follow-up cycle each application starts,
+// not a recurrence of the treatment itself.
+function computeTreatmentStatus(task, data, today) {
+  const last = data.h.length ? parseISODate(data.h[0]) : null;
+  const daysSince = last ? daysBetween(last, today) : null;
+  return {
+    statusKey: "treatment",
+    last,
+    daysSince,
+    // Deliberately never a "due"/"overdue" phrasing, and never a next date.
+    label: last ? `Last applied ${formatShort(last)}` : "Not applied",
+    detail: "",
+  };
+}
+
+// Collapsed-row line for a treatment: what was last done and how long ago,
+// with no scheduling language at all.
+function treatmentRowText(task, status) {
+  const valueLabel = task.value_label || "Last applied";
+  if (!status.last) return `${escapeHtml(valueLabel)}: Never`;
+  return `${escapeHtml(valueLabel)}: ${formatShortYear(status.last)} <span class="dim">· ${relativeDayLabel(status.daysSince).toLowerCase()}</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups — a dependent action a task creates when it is actually done,
+// due a fixed number of days after the REAL completion date (not the date it
+// was scheduled for). Configured on the parent task:
+//
+//   follow_up: { id, name, icon, after_days, action_label }
+//
+// Storage-wise a follow-up is simply its own task id, "<parent>__<id>", so it
+// reuses pyscript.lawn_<id> and lawn_log_task unchanged — no backend change,
+// and it inherits persistence, restart-restore, history and the year-history
+// journal for free. Nothing about it lives in browser memory.
+//
+// The parent's own schedule is untouched: next_fungicide stays
+// last_application + interval_days, and completing the follow-up writes only
+// to the follow-up's entity, so it can never shift the parent's next due date.
+// ---------------------------------------------------------------------------
+
+// Joins a parent id and a follow-up id into the storage id, and so into the
+// entity id pyscript.lawn_<id>. It must not introduce a double underscore:
+// Home Assistant's VALID_ENTITY_ID rejects "__" anywhere in an entity id, and
+// pyscript's state.set() then fails silently, leaving the follow-up with
+// nowhere to persist. "_fu_" keeps every underscore single while staying
+// distinctive enough not to collide with a real task id.
+const FOLLOW_UP_SEPARATOR = "_fu_";
+
+// A task may declare `follow_ups:` (a list) or `follow_up:` (a single object,
+// the original v38 spelling). Both are read here and normalised to a list, so
+// nothing downstream needs to know which spelling a task used and existing
+// single-follow-up configs keep working untouched. Each entry becomes its own
+// independent task with its own storage id, so two follow-ups on one parent
+// never share state.
+function followUpConfigsFor(parent) {
+  if (Array.isArray(parent.follow_ups)) return parent.follow_ups.filter((f) => f && f.id);
+  if (parent.follow_up && parent.follow_up.id) return [parent.follow_up];
+  return [];
+}
+
+function followUpTasksFor(parent) {
+  return followUpConfigsFor(parent).map((config) => ({
+    id: `${parent.id}${FOLLOW_UP_SEPARATOR}${config.id}`,
+    name: config.name || config.id,
+    icon: config.icon || "mdi:check-circle-outline",
+    type: "follow_up",
+    after_days: config.after_days ?? 1,
+    action_label: config.action_label || "DONE TODAY",
+    due_soon_days: config.due_soon_days ?? parent.due_soon_days,
+    // Per-entry values recorded when this follow-up is completed (e.g. an
+    // inspection result). With prompt_on_done the action opens the log form
+    // instead of one-tap logging, so the value is chosen rather than defaulted.
+    entry_fields: config.entry_fields,
+    prompt_on_done: config.prompt_on_done,
+    // Its OWN allocated identity color (see normalizeTaskConfig), not the
+    // parent's — a follow-up is visually its own task. The history source chip
+    // is what keeps the relationship visible, not a shared color.
+    color: config.color,
+    // A follow-up is never categorised in its own right: the parent is the
+    // single source of truth, so re-categorising a parent moves its follow-ups
+    // with it automatically and they can never end up stranded in a category
+    // their parent has left. Copied raw (possibly undefined) so the same
+    // categoryForTask() fallback applies to both.
+    category: parent.category,
+    // Same reasoning for the assignee: whoever owns the treatment owns the
+    // wash that follows from it, so a parent and its follow-ups can never end
+    // up on two different people's tablets.
+    assigned_to: parent.assigned_to,
+    // Kept so the row can say what it follows, and so the status can be
+    // computed against the parent's history.
+    parent_id: parent.id,
+    parent_name: parent.name,
+  }));
+}
+
+// A follow-up is pending from the moment its parent is logged until it is
+// itself logged on or after that application date. Matching by "wash on or
+// after the application" rather than by an id stored on the entry is what
+// makes a late completion work (applied 13th, washed 19th still closes the
+// 13th's follow-up) while a new application always opens a fresh one — the
+// next application date is later than every wash recorded so far, so the
+// cycle re-arms automatically.
+function computeFollowUpStatus(task, data, parentData, today) {
+  const last = data.h.length ? parseISODate(data.h[0]) : null;
+  const parentIso = parentData && parentData.h.length ? parentData.h[0] : null;
+  if (!parentIso) {
+    // Parent never applied — there is nothing to follow up on yet.
+    return { statusKey: "follow_up_done", pending: false, last, label: "Nothing pending", detail: "" };
+  }
+  const parentDate = parseISODate(parentIso);
+  const dueDate = addDays(parentDate, task.after_days);
+  const doneIso = data.h.find((iso) => iso >= parentIso) || null;
+  if (doneIso) {
+    return {
+      statusKey: "follow_up_done",
+      pending: false,
+      last,
+      dueDate,
+      parentDate,
+      label: `Done ${formatShort(parseISODate(doneIso))}`,
+      detail: "",
+    };
+  }
+  return {
+    ...dueDateStatus(dueDate, today, task.due_soon_days ?? 3),
+    pending: true,
+    last,
+    nextDue: dueDate,
+    dueDate,
+    parentDate,
+    detail: `After ${task.parent_name} on ${formatShort(parentDate)}`,
+  };
+}
+
+// Configured tasks, each immediately followed by its synthesized follow-up
+// task (if it configures one). THE single source of truth for "all tasks" —
+// the planner card's _allTasks() and the week calendar's buildWeekEvents()
+// both go through here, so the two cards can never disagree about which
+// follow-ups exist.
+function withFollowUps(tasks) {
+  const out = [];
+  for (const task of tasks || []) {
+    out.push(task);
+    out.push(...followUpTasksFor(task));
+  }
+  return out;
+}
+
+// Collapsed-row line for a pending follow-up: the countdown, then the
+// application it belongs to — which is the whole point of the relationship.
+function followUpRowText(task, status) {
+  return `${escapeHtml(status.label)} <span class="dim">· after ${escapeHtml(task.parent_name)} on ${formatShort(status.parentDate)}</span>`;
 }
 
 // Collapsed-row line: "<value_label>: <date> · <relative>[ · <target clause>]".
@@ -392,6 +770,19 @@ function renderEntryFieldInput(field, dataRole, currentValue) {
     const current = currentValue !== undefined && currentValue !== null ? currentValue : field.default || "";
     return `<input type="text" class="date-input" data-role="${dataRole}" data-field-id="${escapeHtml(field.id)}" data-field-type="text" value="${escapeHtml(String(current))}" placeholder="${escapeHtml(field.label || field.id)}">`;
   }
+  // A fixed list of allowed values from the task's own YAML — same bounded
+  // <select> shape as `number`, but the options are authored rather than
+  // generated from min/max/step. Values are stored and read back as plain
+  // strings, so entryFieldsText/populatedEntryFields need no special case.
+  if (field.type === "select") {
+    const options = Array.isArray(field.options) ? field.options : [];
+    const current = currentValue !== undefined && currentValue !== null && currentValue !== ""
+      ? currentValue
+      : field.default !== undefined ? field.default : options[0];
+    return `<select class="date-input" data-role="${dataRole}" data-field-id="${escapeHtml(field.id)}" data-field-type="select">
+      ${options.map((o) => `<option value="${escapeHtml(String(o))}" ${String(o) === String(current) ? "selected" : ""}>${escapeHtml(String(o))}</option>`).join("")}
+    </select>`;
+  }
   return "";
 }
 
@@ -402,21 +793,122 @@ function resolveProduct(task, entry) {
   return entry.productId && task.products ? task.products.find((p) => p.id === entry.productId) || null : null;
 }
 
-// A small fixed palette of calm, mutually distinguishable accent colors
-// (no red/orange, same "informational, never alarming" convention as the
-// rest of this file's badges/hints) cycled deterministically by task id.
-// Unlike the Tasks tab's --status-color (which reflects a task's CURRENT
-// due/overdue/skipped state and is deliberately never used here), this is
-// keyed only by the task's own id, so a given task's Year History accent
-// never changes as its live status changes over time — completed history
-// is stable, only today's status isn't.
-const HISTORY_TASK_COLORS = ["#3b82f6", "#22c55e", "#a78bfa", "#06b6d4", "#eab308", "#ec4899", "#84cc16", "#14b8a6"];
+// ---------------------------------------------------------------------------
+// Task identity colors
+//
+// Every task gets its own stable accent, derived from its id alone — so it is
+// identical after a restart, a refresh, on another device, in a second card
+// instance, and in the week calendar, with nothing stored anywhere. A task may
+// also pin its own with `color: "#..."` (any CSS color) when the generated one
+// isn't wanted.
+//
+// Generated as HSL rather than picked from a short list, because a handful of
+// hex values repeats almost immediately once there are dozens of tasks:
+// IDENTITY_HUE_STEPS hues x IDENTITY_TONES tones gives plenty of visually
+// distinct slots. The tones are tuned for the dark card — nothing near-black,
+// near-white or washed out — and the hue range deliberately starts past red so
+// an identity color can never be mistaken for the overdue red that overrides
+// it (see eventDisplayColor).
+const IDENTITY_HUE_START = 18;    // skip the reds/oranges reserved for status
+const IDENTITY_HUE_SPAN = 324;    // 18deg .. 342deg
+const IDENTITY_HUE_STEPS = 30;    // ~11deg apart — comfortably distinguishable
+const IDENTITY_TONES = [
+  { s: 68, l: 62 },
+  { s: 50, l: 74 },
+  { s: 82, l: 55 },
+  { s: 38, l: 65 },
+];
+const IDENTITY_SLOTS = IDENTITY_HUE_STEPS * IDENTITY_TONES.length;
+// Probe stride for collision resolution. Coprime with IDENTITY_SLOTS so
+// probing eventually visits every slot, and large enough that a displaced task
+// lands on a clearly different hue rather than the neighbouring shade.
+const IDENTITY_PROBE_STRIDE = 37;
 
-function taskHistoryColor(task) {
-  const key = task.id || task.name || "";
-  let hash = 0;
-  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
-  return HISTORY_TASK_COLORS[Math.abs(hash) % HISTORY_TASK_COLORS.length];
+// FNV-1a-ish with a final avalanche mix. The mixing matters: ids that share a
+// long prefix — a parent task and the follow-ups synthesized beneath it — must
+// not land on neighbouring hues, which a plain rolling hash would do.
+function identityHash(key) {
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822507);
+  h ^= h >>> 13;
+  return Math.abs(h | 0);
+}
+
+function identitySlotColor(slot) {
+  const tone = IDENTITY_TONES[slot % IDENTITY_TONES.length];
+  const hueIndex = Math.floor(slot / IDENTITY_TONES.length) % IDENTITY_HUE_STEPS;
+  const hue = IDENTITY_HUE_START + (hueIndex * IDENTITY_HUE_SPAN) / IDENTITY_HUE_STEPS;
+  return `hsl(${Math.round(hue)}, ${tone.s}%, ${tone.l}%)`;
+}
+
+// The slot an id would like, from two independent bit-fields of its mixed hash.
+function preferredIdentitySlot(id) {
+  const h = identityHash(id);
+  return (((h >>> 8) % IDENTITY_HUE_STEPS) * IDENTITY_TONES.length) + ((h & 0xff) % IDENTITY_TONES.length);
+}
+
+// Assigns every id a DISTINCT color. Hashing alone cannot promise that — with
+// 30-odd tasks the birthday paradox makes a shared slot likely however large
+// the palette — so ids that want a taken slot probe forward deterministically.
+// Allocation walks the ids in sorted order, not config order, so re-ordering
+// the YAML cannot repaint anything. Ids with an explicit `color:` are honoured
+// as-is and never occupy a generated slot.
+//
+// Same task list in, same colors out — which is what makes the planner card and
+// the week calendar agree, since both normalize the identical configured list.
+function allocateIdentityColors(entries) {
+  const taken = new Set();
+  const out = {};
+  for (const entry of [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    const explicit = typeof entry.color === "string" && entry.color.trim() ? entry.color.trim() : null;
+    if (explicit) {
+      out[entry.id] = explicit;
+      continue;
+    }
+    let slot = preferredIdentitySlot(entry.id);
+    for (let i = 0; i < IDENTITY_SLOTS && taken.has(slot); i++) {
+      slot = (slot + IDENTITY_PROBE_STRIDE) % IDENTITY_SLOTS;
+    }
+    taken.add(slot);
+    out[entry.id] = identitySlotColor(slot);
+  }
+  return out;
+}
+
+// The color to paint a task with. Normalization (see normalizeTaskConfig) has
+// already written the allocated value onto `color`, so this is a plain read;
+// the hash fallback only covers tasks built by hand that never went through it.
+function taskIdentityColor(task) {
+  const explicit = task && task.color;
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+  return identitySlotColor(preferredIdentitySlot((task && (task.id || task.name)) || ""));
+}
+
+// The sections whose status color says nothing beyond "scheduled" or "logged".
+// For those the task's identity color is shown instead; every other section —
+// needs attention, season finished, inactive, optional — keeps its semantic
+// color, because those genuinely report something the identity color would
+// bury. This is the single place that decides identity-vs-status, so the
+// planner card and the week calendar can never disagree.
+const IDENTITY_COLOR_SECTIONS = new Set(["upcoming", "logs"]);
+
+// THE resolver. Priority:
+//   1. a status whose section carries meaning -> that status's own color
+//      (red for overdue, green for completed, purple for optional, ...)
+//   2. otherwise -> the task's stable identity color
+// `attention` is true only for the needs-attention section, and is what the
+// week calendar uses to also redden the status text.
+function eventDisplayColor(task, statusKey) {
+  const meta = statusKey ? STATUS_META[statusKey] : null;
+  if (meta && !IDENTITY_COLOR_SECTIONS.has(meta.section)) {
+    return { color: meta.color, attention: meta.section === "needs_attention" };
+  }
+  return { color: taskIdentityColor(task), attention: false };
 }
 
 // The entry_fields whose value is actually set on this entry — skips
@@ -474,6 +966,212 @@ function renderMediaThumb(media, thumbClass) {
   return `<img class="${thumbClass}" src="${thumbUrl}" data-action="view-photo" data-original="${originalUrl}" loading="lazy" alt="Photo" onerror="this.style.display='none'">`;
 }
 
+// ---------------------------------------------------------------------------
+// Categories
+//
+// A task belongs to exactly one category, named by an arbitrary id string
+// ("lawn", "house", "cars_bikes", and equally "solar", "pool", "equipment",
+// ... — nothing here enumerates them). No behaviour is ever keyed off a
+// particular id: a category is only ever compared for equality and looked up
+// in a label map, so adding one is pure configuration.
+//
+// A task with no `category:` is treated as DEFAULT_CATEGORY. That is a
+// *runtime* fallback for configs written before categories existed (this
+// project started as a lawn-only card, so lawn is the only sensible default);
+// nothing ever rewrites anyone's YAML to make it explicit.
+const DEFAULT_CATEGORY = "lawn";
+
+function categoryForTask(task) {
+  const raw = task && task.category;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : DEFAULT_CATEGORY;
+}
+
+// THE filter. Everything category-scoped goes through here, so "which tasks
+// participate" is decided in exactly one place and the status/section/history
+// code downstream never learns that categories exist. A null/empty category
+// means "no restriction" — the week calendar's unrestricted mode.
+function tasksForCategory(tasks, category) {
+  if (!category) return tasks || [];
+  return (tasks || []).filter((t) => categoryForTask(t) === category);
+}
+
+function distinctCategories(tasks) {
+  const out = [];
+  for (const t of tasks || []) {
+    const c = categoryForTask(t);
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+// Last-resort label when a category id has no configured label: "cars_bikes"
+// -> "Cars Bikes". Any label that is not a plain word-per-separator rendering
+// (e.g. "Cars/Bikes") has to be configured explicitly — which is precisely
+// what `categories:` / `category_labels:` are for.
+function defaultCategoryLabel(id) {
+  return String(id)
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+// Reads both supported spellings off a card config and returns {id: label}:
+//
+//   categories:                    category_labels:
+//     - id: cars_bikes               cars_bikes: Cars/Bikes
+//       label: Cars/Bikes
+//
+// `categories:` additionally fixes the selector's order (see categoryOrder);
+// `category_labels:` is a pure label map and wins on conflict, so a bare
+// `categories: [lawn, house]` id list can be labelled separately.
+function buildCategoryLabels(config) {
+  const map = {};
+  if (Array.isArray(config && config.categories)) {
+    for (const entry of config.categories) {
+      if (typeof entry === "string") map[entry] = defaultCategoryLabel(entry);
+      else if (entry && entry.id) map[entry.id] = typeof entry.label === "string" ? entry.label : defaultCategoryLabel(entry.id);
+    }
+  }
+  const explicit = config && config.category_labels;
+  if (explicit && typeof explicit === "object" && !Array.isArray(explicit)) {
+    for (const [id, label] of Object.entries(explicit)) if (typeof label === "string") map[id] = label;
+  }
+  return map;
+}
+
+function configuredCategoryIds(config) {
+  if (!Array.isArray(config && config.categories)) return [];
+  return config.categories.map((e) => (typeof e === "string" ? e : e && e.id)).filter(Boolean);
+}
+
+function categoryLabel(id, labels) {
+  return (labels && labels[id]) || defaultCategoryLabel(id);
+}
+
+// The categories the selector offers, in order: every explicitly configured
+// one first (so an empty category still gets a chip — categories exist because
+// they are declared, not because a task happens to use them), then any
+// category a task uses that was not declared, then the active one if it is
+// somehow neither. Never empty.
+function categoryOrder(config, tasks, active) {
+  const out = [];
+  const push = (id) => {
+    if (id && !out.includes(id)) out.push(id);
+  };
+  for (const id of configuredCategoryIds(config)) push(id);
+  for (const id of distinctCategories(tasks)) push(id);
+  push(active);
+  return out.length ? out : [DEFAULT_CATEGORY];
+}
+
+// ---------------------------------------------------------------------------
+// Assignees
+//
+// A task may name exactly one person responsible for it:
+//
+//   people:                     # card level, ids stable, names editable
+//     - id: person_1
+//       name: Person 1
+//   tasks:
+//     - id: some_task
+//       assigned_to: person_1   # a scalar id, never a list
+//
+// and a card instance may narrow itself to one of them:
+//
+//   assignee: person_1 | unassigned | all      # default: all
+//
+// This is a VISIBILITY property only. There is exactly one task and one
+// completion state behind every view — filtering changes which tasks a card
+// shows, never what a task is or what logging one does. Omitting `assigned_to`
+// (every task written before this existed) means unassigned, and nothing is
+// ever auto-assigned or auto-cleared.
+const ASSIGNEE_ALL = "all";
+const ASSIGNEE_UNASSIGNED = "unassigned";
+
+// Normalizes the card's `people:` list. Entries without an id are dropped (a
+// person with no stable id could not be referenced by a task), duplicates keep
+// the first definition, and a missing name falls back to the id so a
+// half-written config still renders something meaningful.
+function normalizePeopleConfig(people, cardName) {
+  const out = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(people) ? people : []) {
+    const id = entry && typeof entry.id === "string" ? entry.id.trim() : "";
+    if (!id) {
+      // eslint-disable-next-line no-console
+      console.warn(`${cardName}: a people[] entry has no \`id\` and was ignored — an id is what tasks reference.`);
+      continue;
+    }
+    if (seen.has(id)) {
+      // eslint-disable-next-line no-console
+      console.warn(`${cardName}: duplicate person id "${id}" — only the first definition is used.`);
+      continue;
+    }
+    seen.add(id);
+    out.push({ id, name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : id });
+  }
+  return out;
+}
+
+// The person responsible for a task, or null when nobody is. A list is
+// rejected outright rather than silently taking the first element: "exactly
+// one assignee" is the rule, and quietly honouring half of a mistake would
+// hide it.
+function assigneeForTask(task, cardName) {
+  const raw = task && task.assigned_to;
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `${cardName || "lawn-maintenance-card"}: task "${(task && task.id) || "?"}" has a non-scalar \`assigned_to\` — a task may have at most one assignee, so it is treated as unassigned.`
+    );
+    return null;
+  }
+  const id = raw.trim();
+  return id || null;
+}
+
+// THE assignee filter. Both cards call this and nothing else, so a person's
+// task list, their week calendar and every count derived from either can never
+// disagree. `all` (and anything falsy, i.e. an unconfigured card) passes
+// everything through unchanged — that is what keeps old configs working.
+function tasksForAssignee(tasks, assignee) {
+  if (!assignee || assignee === ASSIGNEE_ALL) return tasks || [];
+  if (assignee === ASSIGNEE_UNASSIGNED) return (tasks || []).filter((t) => assigneeForTask(t) === null);
+  return (tasks || []).filter((t) => assigneeForTask(t) === assignee);
+}
+
+// Display name for an assignee id. An id that no longer exists in `people:`
+// (renamed, removed, or a typo) is shown as unknown rather than hidden or
+// silently reassigned — see the warning in warnUnknownAssignees.
+function personName(id, people) {
+  if (!id) return "Unassigned";
+  const match = (people || []).find((p) => p.id === id);
+  return match ? match.name : `Unknown: ${id}`;
+}
+
+function isKnownPerson(id, people) {
+  return !!(people || []).some((p) => p.id === id);
+}
+
+// Warns once per unresolved id at config time. Deliberately does NOT touch the
+// task: removing a person from `people:` must never silently delete or move
+// their assignments, so they stay visible as unknown until reassigned by hand.
+function warnUnknownAssignees(tasks, people, cardName) {
+  if (!people || !people.length) return;
+  const reported = new Set();
+  for (const task of tasks || []) {
+    const id = assigneeForTask(task, cardName);
+    if (!id || isKnownPerson(id, people) || reported.has(id)) continue;
+    reported.add(id);
+    // eslint-disable-next-line no-console
+    console.warn(
+      `${cardName}: task "${task.id}" is assigned to "${id}", which is not in people[]. It is shown as unknown and left untouched — add the person back or reassign the task.`
+    );
+  }
+}
+
 // Fills in derived task/product ids and the boolean flags the rest of this
 // file relies on. Module-level and card-name-parameterized so both cards
 // normalize the same YAML into the same shape — LawnWeekCalendar reads the
@@ -483,7 +1181,7 @@ function renderMediaThumb(media, thumbClass) {
 // different entity in each card.
 function normalizeTaskConfig(tasks, cardName) {
   const seen = new Set();
-  return tasks.map((t, i) => {
+  const normalized = tasks.map((t, i) => {
     const id = t.id || t.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     if (!t.id) {
       // eslint-disable-next-line no-console
@@ -504,6 +1202,32 @@ function normalizeTaskConfig(tasks, cardName) {
         })
       : undefined;
     return { ...t, id, optional: !!t.optional, allow_photo: !!t.allow_photo, ...(products ? { products } : {}) };
+  });
+
+  // Identity colors are allocated across the WHOLE list at once — including the
+  // ids follow-ups will be synthesized under, so a parent and its follow-ups
+  // are as distinct from each other as any two tasks. Doing it here means both
+  // cards get the same answer for free: each normalizes the same configured
+  // list, so neither can invent a palette of its own.
+  const entries = [];
+  for (const task of normalized) {
+    entries.push({ id: task.id, color: task.color });
+    for (const followUp of followUpConfigsFor(task)) {
+      entries.push({ id: `${task.id}${FOLLOW_UP_SEPARATOR}${followUp.id}`, color: followUp.color });
+    }
+  }
+  const palette = allocateIdentityColors(entries);
+  return normalized.map((task) => {
+    const followUps = followUpConfigsFor(task);
+    if (!followUps.length) return { ...task, color: palette[task.id] };
+    // Rewritten onto whichever spelling the task used, so followUpTasksFor
+    // finds the allocated color without knowing anything about allocation.
+    const withColors = followUps.map((f) => ({ ...f, color: palette[`${task.id}${FOLLOW_UP_SEPARATOR}${f.id}`] }));
+    return {
+      ...task,
+      color: palette[task.id],
+      ...(Array.isArray(task.follow_ups) ? { follow_ups: withColors } : { follow_up: withColors[0] }),
+    };
   });
 }
 
@@ -576,12 +1300,36 @@ function applyOptionalRemap(task, status, today) {
     return { ...status, statusKey: key, label };
   }
 
-  // Recurring: inactive (out of season, or interval math suspended by the
-  // season gap check) always maps to "Optional · inactive" — the original,
-  // more detailed label ("Inactive · resumes September") is kept as the
-  // status detail so it's still visible when the row is expanded.
+  // Recurring: "inactive" covers both ways computeRecurringStatus can decide
+  // the task isn't live right now — today's month is outside active_months,
+  // or the interval landed in a season gap. Either way the useful question is
+  // the same: does this task come back before the year ends?
+  //
+  //   yes -> Inactive, labelled with the month it resumes
+  //   no  -> Season finished, alongside the seasonal tasks that are done
+  //          for the year
+  //
+  // Tasks with no active_months configured have no season to be in or out of,
+  // so they keep the original "Optional · inactive" in Optional rather than
+  // being declared finished for a year they were never scheduled against.
   if (status.statusKey === "inactive") {
-    return { ...status, statusKey: "optional_finished", label: "Optional · inactive", detail: status.label };
+    const activeMonths = task.active_months || [];
+    if (!activeMonths.length) {
+      return { ...status, statusKey: "optional_finished", label: "Optional · inactive", detail: status.label };
+    }
+    const resumesMonth = nextActiveMonthThisYear(activeMonths, today);
+    if (resumesMonth) {
+      return {
+        ...status,
+        statusKey: "optional_inactive",
+        label: `Inactive · resumes ${MONTH_ABBR[resumesMonth - 1]}`,
+        // The fuller "Inactive · resumes September 2027"-style line stays as
+        // the detail, so the expanded row still spells out the year when the
+        // next occurrence is further off.
+        detail: status.label,
+      };
+    }
+    return { ...status, statusKey: "optional_season_over", label: "Optional · season finished", detail: status.label };
   }
   // Never completed, currently active — nothing to be "overdue" about yet.
   if (status.statusKey === "recommended_now") {
@@ -607,10 +1355,23 @@ function applyOptionalRemap(task, status, today) {
 // computeTaskStatus below).
 const OPTIONAL_SEASON_ENDED_KEYS = new Set(["optional_finished", "completed", "skipped"]);
 
-function computeTaskStatus(task, data, today) {
+// Keys that opt out of the blanket "optional tasks live in Optional" rule and
+// use their STATUS_META section instead: an optional task that is out of
+// season, done for the year, or whose window is still beyond the 30-day
+// horizon belongs in Inactive/Season finished the same way a mandatory one
+// does. season_inactive needs no optional-specific remap — "Inactive · starts
+// 24 Sep" already reads calmly, and the row keeps its Optional badge.
+const OPTIONAL_OWN_SECTION_KEYS = new Set(["optional_inactive", "optional_season_over", "season_inactive"]);
+
+// `parentData` is only used by follow-up tasks, which need their parent's
+// history to know what they are following and whether they are still pending.
+function computeTaskStatus(task, data, today, parentData) {
   let status;
   if (task.type === "seasonal") status = computeSeasonalStatus(task, data, today);
   else if (task.type === "log") status = computeLogStatus(task, data, today);
+  else if (task.type === "program") status = computeProgramStatus(task, data, today);
+  else if (task.type === "treatment") status = computeTreatmentStatus(task, data, today);
+  else if (task.type === "follow_up") status = computeFollowUpStatus(task, data, parentData, today);
   else status = computeRecurringStatus(task, data, today);
   status = applyOptionalRemap(task, status, today);
   const meta = STATUS_META[status.statusKey] || STATUS_META.inactive;
@@ -621,8 +1382,10 @@ function computeTaskStatus(task, data, today) {
   // completed, or skipped) moves to Season finished alongside its
   // mandatory counterparts instead of sitting in Optional forever — its
   // label/color stay whatever the remap already set (calm purple, never
-  // the red/orange "missed" styling), only the section changes. Optional
-  // recurring tasks always stay in Optional regardless of state. Log tasks
+  // the red/orange "missed" styling), only the section changes. An optional
+  // recurring task has three destinations, decided by the remap above and
+  // carried here by its statusKey: Inactive when it returns later this year,
+  // Season finished when it doesn't, Optional the rest of the time. Log tasks
   // always use their own "logs" section regardless of `optional` — that
   // flag has no meaning for them (see applyOptionalRemap).
   let section;
@@ -630,12 +1393,18 @@ function computeTaskStatus(task, data, today) {
     section = meta.section;
   } else if (!task.optional) {
     section = meta.section;
+  } else if (OPTIONAL_OWN_SECTION_KEYS.has(status.statusKey)) {
+    section = meta.section;
   } else if (task.type === "seasonal" && OPTIONAL_SEASON_ENDED_KEYS.has(status.statusKey)) {
     section = "season_finished";
   } else {
     section = "optional";
   }
-  return { ...status, section, rank: meta.rank, color: meta.color, icon: meta.icon };
+  // The accent every view paints this task with, resolved once here so the
+  // planner row, its icon, and the week calendar all read the same value:
+  // a meaningful status color, else the task's own identity color.
+  const display = eventDisplayColor(task, status.statusKey);
+  return { ...status, section, rank: meta.rank, color: display.color, attention: display.attention, icon: meta.icon };
 }
 
 // Product rotation — pure function, same style as the status engine above:
@@ -782,6 +1551,11 @@ function secondaryTime(task, status) {
   if (task.type === "seasonal") {
     return status.windowStart ? status.windowStart.getTime() : 0;
   }
+  // An out-of-season recurring task sorts by when it comes back, not by a
+  // nextDue that season state has already overruled — this is what puts the
+  // Inactive section in "nearest return first" order alongside seasonal rows,
+  // which sort by their window start above.
+  if (status.resumesAt) return status.resumesAt.getTime();
   return status.nextDue ? status.nextDue.getTime() : status.last ? status.last.getTime() : 0;
 }
 
@@ -809,11 +1583,45 @@ class LawnMaintenanceCard extends HTMLElement {
       throw new Error("lawn-maintenance-card: `tasks` (array) is required in the card config");
     }
     this._config = {
-      title: config.title || "LAWN MAINTENANCE",
+      // An explicit `title:` still wins outright, so configs that set one keep
+      // exactly the heading they asked for; left null it follows the selected
+      // category instead ("LAWN MAINTENANCE" / "HOUSE MAINTENANCE" / ...).
+      title: typeof config.title === "string" ? config.title : null,
       tasks: normalizeTaskConfig(config.tasks, "lawn-maintenance-card"),
       show_overview: config.show_overview !== false,
+      // Declared categories exist whether or not any task uses them yet — an
+      // empty category is a normal state, not a reason to hide it.
+      categories: configuredCategoryIds(config),
+      categoryLabels: buildCategoryLabels(config),
+      // The card's *initial* category. Never falls back to another category
+      // just because this one is currently empty (that shows an empty state),
+      // and never itself changes — see _setCategory.
+      defaultCategory: typeof config.category === "string" && config.category.trim() ? config.category.trim() : null,
+      people: normalizePeopleConfig(config.people, "lawn-maintenance-card"),
+      // Which person's tasks this card instance shows. Absent means "all",
+      // which is what makes every pre-assignee config keep working untouched.
+      assignee:
+        typeof config.assignee === "string" && config.assignee.trim() ? config.assignee.trim() : ASSIGNEE_ALL,
     };
+    warnUnknownAssignees(this._config.tasks, this._config.people, "lawn-maintenance-card");
+    if (
+      this._config.assignee !== ASSIGNEE_ALL &&
+      this._config.assignee !== ASSIGNEE_UNASSIGNED &&
+      this._config.people.length &&
+      !isKnownPerson(this._config.assignee, this._config.people)
+    ) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `lawn-maintenance-card: assignee "${this._config.assignee}" is not in people[] — this card will show no tasks until it is corrected.`
+      );
+    }
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
+    // Runtime-only selection, seeded from the config here and afterwards owned
+    // solely by _setCategory. A Lovelace reload runs setConfig again and so
+    // returns to the configured default; a hass push never touches it.
+    this._activeCategory =
+      this._config.defaultCategory ||
+      categoryOrder(this._config, this._config.tasks, null)[0];
     this._built = false;
     this._view = "tasks";
     // Selected year on the Year History tab. Deliberately only ever
@@ -864,6 +1672,9 @@ class LawnMaintenanceCard extends HTMLElement {
     // _advisoryCache: task_id -> { fetching, fetchedAt, durationMet, error }
     // for advisory.duration_hours checks — see _refreshAdvisoryDuration.
     this._advisoryCache = {};
+    // Task id whose assignee is currently being written back to the dashboard
+    // config, or null. Only used to disable the select and show "Saving…".
+    this._assigneeSaving = null;
     if (!this._collapsedSections) this._collapsedSections = new Set(DEFAULT_COLLAPSED_SECTIONS);
     this._render();
   }
@@ -915,7 +1726,11 @@ class LawnMaintenanceCard extends HTMLElement {
   }
 
   _computeSignature() {
-    const taskSig = this._config.tasks
+    // Category-scoped: only the tasks actually on screen can change what is on
+    // screen, so a write in another category cannot force a repaint here. The
+    // active category is part of the signature because it changes the render
+    // just as much as an entity does.
+    const taskSig = this._categoryTasks()
       .map((t) => {
         const st = this._hass.states[`pyscript.lawn_${t.id}`];
         return st ? `${t.id}:${st.last_updated}` : `${t.id}:none`;
@@ -930,7 +1745,7 @@ class LawnMaintenanceCard extends HTMLElement {
     const advisoryEntity = expandedTask && expandedTask.advisory && expandedTask.advisory.entity;
     const advisorySt = advisoryEntity ? this._hass.states[advisoryEntity] : null;
     const advisorySig = advisoryEntity ? `${advisoryEntity}:${advisorySt ? advisorySt.last_updated : "none"}` : "";
-    return `${taskSig}::${advisorySig}`;
+    return `${this._activeCategory}::${taskSig}::${advisorySig}`;
   }
 
   getCardSize() {
@@ -945,6 +1760,177 @@ class LawnMaintenanceCard extends HTMLElement {
         { id: "tenacity", name: "Tenacity", type: "seasonal", icon: "mdi:flower-pollen", window: { start: "02-15", end: "03-15" } },
       ],
     };
+  }
+
+  // Configured tasks, each immediately followed by its synthesized follow-up
+  // task (if it configures one). Everything that walks "all tasks" — the
+  // render signature, action dispatch, the task list, year history — uses
+  // this, so a follow-up behaves like a first-class task without ever being
+  // written into the user's YAML. Follow-ups are always present here even
+  // when nothing is pending; _renderTasks decides visibility, while history
+  // and re-render signatures need them unconditionally.
+  _allTasks() {
+    return withFollowUps(this._config.tasks);
+  }
+
+  // The effective task list for everything the user can see: _allTasks()
+  // narrowed to the selected category. Every view renders from this, so
+  // switching category only ever changes *which* tasks participate — the
+  // status engine, section routing, counts, details, history and overview all
+  // keep running the identical code on a smaller list. Follow-ups filter
+  // correctly for free, since they carry their parent's category.
+  //
+  // Action dispatch deliberately still uses the unfiltered _allTasks(): a
+  // click can only come from a row that is on screen anyway, and resolving a
+  // task id must never depend on the current selection.
+  //
+  // The assignee filter is applied HERE, in the same single place as the
+  // category one and before any status/section/count work, so a person's rows,
+  // their section counts, their Year Overview and their Year History are all
+  // derived from one identical list. A follow-up inherits its parent's
+  // assignee for the same reason it inherits the category: the pair must never
+  // be split across two people's views.
+  _categoryTasks() {
+    return tasksForAssignee(tasksForCategory(this._allTasks(), this._activeCategory), this._config.assignee);
+  }
+
+  // True when this card is a personal view rather than the master one.
+  _isPersonView() {
+    return !!this._config.assignee && this._config.assignee !== ASSIGNEE_ALL;
+  }
+
+  _personName(id) {
+    return personName(id, this._config.people || []);
+  }
+
+  // Single-select, never multi: one task has at most one assignee, and the
+  // control makes that structurally true rather than merely documented.
+  _renderAssigneeSelect(task) {
+    const current = assigneeForTask(task, "lawn-maintenance-card") || "";
+    const options = [`<option value="" ${current ? "" : "selected"}>Unassigned</option>`];
+    for (const person of this._config.people || []) {
+      options.push(
+        `<option value="${escapeHtml(person.id)}" ${person.id === current ? "selected" : ""}>${escapeHtml(person.name)}</option>`
+      );
+    }
+    // An id that is no longer in people[] keeps an option of its own, so simply
+    // opening the menu can never silently drop an assignment the user has not
+    // chosen to change.
+    if (current && !isKnownPerson(current, this._config.people || [])) {
+      options.push(`<option value="${escapeHtml(current)}" selected>Unknown: ${escapeHtml(current)}</option>`);
+    }
+    const pending = this._assigneeSaving === task.id;
+    return `<select class="date-input assignee-select" data-role="assignee" data-task-id="${escapeHtml(task.id)}" ${
+      pending ? "disabled" : ""
+    }>${options.join("")}</select>${pending ? ` <span class="dim">Saving…</span>` : ""}`;
+  }
+
+  // Writes the choice back to the task's own configuration — the dashboard
+  // config, which is where every other property of a task already lives. No
+  // second store is introduced: assignment travels with the task.
+  //
+  // Read-modify-write, re-fetching immediately before saving so the window in
+  // which a concurrent dashboard edit could be overwritten is as small as
+  // possible, and touching ONLY this task's `assigned_to` key.
+  async _setAssignee(taskId, personId) {
+    if (!this._hass || !this._hass.callWS) return;
+    this._assigneeSaving = taskId;
+    this._error = null;
+    this._renderBody();
+    const urlPath = (window.location.pathname || "").split("/").filter(Boolean)[0] || null;
+    const fetchConfig = (p) => this._hass.callWS(p ? { type: "lovelace/config", url_path: p } : { type: "lovelace/config" });
+    try {
+      let path = urlPath;
+      let config;
+      try {
+        config = await fetchConfig(path);
+      } catch (err) {
+        // The url_path taken from the address bar can be wrong (a subview, a
+        // moved dashboard); fall back to the default one exactly as the week
+        // calendar's discovery does.
+        path = null;
+        config = await fetchConfig(null);
+      }
+      let found = 0;
+      (function walk(node) {
+        if (Array.isArray(node)) return node.forEach(walk);
+        if (!node || typeof node !== "object") return;
+        if (node.type === "custom:lawn-maintenance-card" && Array.isArray(node.tasks)) {
+          for (const t of node.tasks) {
+            if (t && t.id === taskId) {
+              found++;
+              // Unassigned is stored by ABSENCE, matching how every other
+              // optional task property behaves, so an unassigned task is
+              // byte-identical to one written before this feature existed.
+              if (personId) t.assigned_to = personId;
+              else delete t.assigned_to;
+            }
+          }
+          return;
+        }
+        Object.values(node).forEach(walk);
+      })(config);
+      if (!found) throw new Error(`task "${taskId}" was not found in this dashboard's configuration`);
+      await this._hass.callWS(
+        path ? { type: "lovelace/config/save", url_path: path, config } : { type: "lovelace/config/save", config }
+      );
+      // Saving fires lovelace_updated; HA hands every card its new config, so
+      // this card (and any other instance, on any tablet) re-runs setConfig and
+      // picks the change up on its own. Nothing to patch by hand.
+    } catch (err) {
+      this._showError(`Could not save the assignee: ${err.message || err}`);
+    } finally {
+      this._assigneeSaving = null;
+      this._renderBody();
+    }
+  }
+
+  // The subtle "who is this for" marker on a row. Only ever rendered on the
+  // master card: on a card already narrowed to one person it would repeat the
+  // same name on every line, which is exactly what makes a personal tablet
+  // feel like a list of somebody else's chores. Unassigned tasks show nothing
+  // at all — absence is the quieter, and more common, signal.
+  _assigneeChip(task) {
+    // No people configured means the feature is not in use here: show nothing,
+    // so a config written before assignees existed looks exactly as it did.
+    if (!(this._config.people || []).length || this._isPersonView()) return "";
+    const id = assigneeForTask(task, "lawn-maintenance-card");
+    if (!id) return "";
+    const known = isKnownPerson(id, this._config.people || []);
+    return `<span class="assignee-chip ${known ? "" : "unknown"}" title="${escapeHtml(
+      known ? `Assigned to ${this._personName(id)}` : `Assigned to "${id}", who is not in people[]`
+    )}"><ha-icon icon="mdi:account${known ? "" : "-alert"}-outline"></ha-icon>${escapeHtml(this._personName(id))}</span>`;
+  }
+
+  // Recomputed per render rather than cached, so editing the dashboard's task
+  // list is picked up without a special case.
+  _categoryOrder() {
+    return categoryOrder(this._config, this._config.tasks, this._activeCategory);
+  }
+
+  _categoryLabel(id) {
+    return categoryLabel(id, this._config.categoryLabels);
+  }
+
+  // Runtime-only category selection. Nothing outside this method and
+  // setConfig ever assigns _activeCategory, which is what keeps the choice
+  // stable across live state pushes, completions, edits and re-renders.
+  _setCategory(category) {
+    if (!category || category === this._activeCategory) return;
+    this._activeCategory = category;
+    // Everything open belonged to the category being left — an expanded panel
+    // or a half-filled form from the old category must not survive the switch.
+    this._expandedId = null;
+    this._addAppOpen = null;
+    this._addAppSelectedProduct = null;
+    this._addAppPhotoFile = null;
+    this._overrideOpen = null;
+    this._editingEntry = null;
+    // Force the next hass push through _renderBody: the signature is
+    // category-scoped, so entity changes that arrived while another category
+    // was selected were legitimately never rendered.
+    this._lastSignature = null;
+    this._renderBody();
   }
 
   _taskState(taskId) {
@@ -1170,7 +2156,9 @@ class LawnMaintenanceCard extends HTMLElement {
 
   _handleAction(action, el) {
     const taskId = el.dataset.taskId;
-    const task = this._config.tasks.find((t) => t.id === taskId);
+    // _allTasks so a follow-up's own action button ("WASHED TODAY") resolves
+    // to its synthesized task and goes through the identical write path.
+    const task = this._allTasks().find((t) => t.id === taskId);
     const body = this._el.body;
     // save-add-app / save-override / save-edit look up their date input by
     // [data-role] alone (not scoped to `taskId`) — safe only because at most
@@ -1191,7 +2179,12 @@ class LawnMaintenanceCard extends HTMLElement {
         break;
       }
       case "done": {
-        if ((task.products && task.products.length) || task.allow_photo) {
+        // prompt_on_done: the task wants its entry_fields CHOSEN rather than
+        // silently defaulted (an inspection result is the outcome of the
+        // action, not a constant), so route the one-tap action through the
+        // same log form products/photos already use. Opt-in, so every existing
+        // task keeps its instant "record the YAML default" behaviour.
+        if ((task.products && task.products.length) || task.allow_photo || task.prompt_on_done) {
           // A product must be chosen, or a photo may be attached — either
           // way logging needs user interaction, so open the log-application
           // form (pre-filled with today) instead of instant-logging. Handles
@@ -1449,6 +2442,7 @@ class LawnMaintenanceCard extends HTMLElement {
             <button class="tab tab-history">Year History</button>
           </div>
         </div>
+        <div class="category-bar" hidden></div>
         <div class="error-banner" hidden></div>
         <div class="undo-banner" hidden></div>
         <div class="body"></div>
@@ -1464,6 +2458,7 @@ class LawnMaintenanceCard extends HTMLElement {
       tabTasks: root.querySelector(".tab-tasks"),
       tabOverview: root.querySelector(".tab-overview"),
       tabHistory: root.querySelector(".tab-history"),
+      categoryBar: root.querySelector(".category-bar"),
       errorBanner: root.querySelector(".error-banner"),
       undoBanner: root.querySelector(".undo-banner"),
       body: root.querySelector(".body"),
@@ -1487,6 +2482,11 @@ class LawnMaintenanceCard extends HTMLElement {
     this._el.tabHistory.addEventListener("click", () => {
       this._view = "history";
       this._render();
+    });
+
+    this._el.categoryBar.addEventListener("click", (ev) => {
+      const chip = ev.target.closest("[data-category]");
+      if (chip) this._setCategory(chip.dataset.category);
     });
 
     this._el.undoBanner.addEventListener("click", (ev) => {
@@ -1520,6 +2520,11 @@ class LawnMaintenanceCard extends HTMLElement {
         this._renderBody();
         return;
       }
+      const assigneeSelect = ev.target.closest('[data-role="assignee"]');
+      if (assigneeSelect) {
+        this._setAssignee(assigneeSelect.dataset.taskId, assigneeSelect.value);
+        return;
+      }
       const yearSelect = ev.target.closest('[data-role="history-year"]');
       if (yearSelect) {
         this._historyYear = Number(yearSelect.value);
@@ -1539,7 +2544,29 @@ class LawnMaintenanceCard extends HTMLElement {
   }
 
   _renderBody() {
-    this._el.title.textContent = this._config.title;
+    const order = this._categoryOrder();
+    // An explicit `title:` still wins outright. Otherwise a card narrowed to
+    // one person is titled with that person's configured name — their tablet
+    // reads as "their tasks" rather than repeating the label on every row —
+    // and the master card keeps the existing category heading unchanged.
+    this._el.title.textContent =
+      this._config.title ||
+      (this._isPersonView()
+        ? (this._config.assignee === ASSIGNEE_UNASSIGNED
+            ? "UNASSIGNED"
+            : this._personName(this._config.assignee).toUpperCase())
+        : `${this._categoryLabel(this._activeCategory).toUpperCase()} MAINTENANCE`);
+    // A single category is the pre-categories world: no selector at all, so
+    // an existing config that never heard of categories looks untouched.
+    this._el.categoryBar.hidden = order.length < 2;
+    this._el.categoryBar.innerHTML = order
+      .map(
+        (id) =>
+          `<button class="category-chip ${id === this._activeCategory ? "active" : ""}" data-category="${escapeHtml(id)}"${
+            id === this._activeCategory ? ' aria-current="true"' : ""
+          }>${escapeHtml(this._categoryLabel(id))}</button>`
+      )
+      .join("");
     this._el.tabTasks.classList.toggle("active", this._view === "tasks");
     this._el.tabOverview.classList.toggle("active", this._view === "overview");
     this._el.tabHistory.classList.toggle("active", this._view === "history");
@@ -1585,9 +2612,14 @@ class LawnMaintenanceCard extends HTMLElement {
     // through to the normal "logs" bucket like any other section.
     const pinnedRows = [];
 
-    for (const task of this._config.tasks) {
+    for (const task of this._categoryTasks()) {
       const data = this._taskState(task.id);
-      const status = computeTaskStatus(task, data, today);
+      const parentData = task.type === "follow_up" ? this._taskState(task.parent_id) : null;
+      const status = computeTaskStatus(task, data, today, parentData);
+      // A follow-up only exists on the list while it is actually outstanding:
+      // once logged (or before its parent has ever been done) it drops out of
+      // the actionable list entirely, its record living on in history.
+      if (task.type === "follow_up" && !status.pending) continue;
       const row = { task, data, status, sec: secondaryTime(task, status) };
       if (task.type === "log" && task.pinned) {
         pinnedRows.push(row);
@@ -1622,7 +2654,22 @@ class LawnMaintenanceCard extends HTMLElement {
         </div>
       `;
     }
-    return html || `<div class="empty-state">No tasks configured.</div>`;
+    return html || this._emptyCategoryState();
+  }
+
+  // A declared category with nothing in it yet is a normal, expected state:
+  // say so plainly instead of falling back to another category's tasks. A
+  // person with nothing assigned to them reads the same way, naming the person
+  // rather than the category so an empty tablet explains itself.
+  _emptyCategoryState() {
+    if (this._isPersonView()) {
+      const who =
+        this._config.assignee === ASSIGNEE_UNASSIGNED ? "unassigned" : this._personName(this._config.assignee);
+      return `<div class="empty-state">No ${escapeHtml(this._categoryLabel(this._activeCategory))} maintenance tasks ${
+        this._config.assignee === ASSIGNEE_UNASSIGNED ? "are unassigned." : `assigned to ${escapeHtml(who)}.`
+      }</div>`;
+    }
+    return `<div class="empty-state">No ${escapeHtml(this._categoryLabel(this._activeCategory))} maintenance tasks configured.</div>`;
   }
 
   // Log tasks get their own compact row: a prominent quick-action button
@@ -1633,20 +2680,31 @@ class LawnMaintenanceCard extends HTMLElement {
   // stops propagation for anything with [data-action], so clicking it can
   // never also toggle the row's expanded state.
   _renderLogTaskRow(task, data, status) {
+    return this._renderQuickActionRow(task, data, status, logRowText(task, status), "mdi:notebook-outline");
+  }
+
+  // Pending follow-ups use the same compact quick-action row as log tasks —
+  // same markup, same CSS, same responsive behaviour — differing only in the
+  // information line (countdown + the application it follows).
+  _renderFollowUpRow(task, data, status) {
+    return this._renderQuickActionRow(task, data, status, followUpRowText(task, status), "mdi:check-circle-outline");
+  }
+
+  _renderQuickActionRow(task, data, status, lineHtml, defaultIcon) {
     const expanded = this._expandedId === task.id;
     const actionLabel = task.action_label || "DONE TODAY";
     return `
       <div class="task log-task ${expanded ? "expanded" : ""}" style="--status-color:${status.color}">
         <div class="task-header" data-task-id="${task.id}">
-          <ha-icon class="task-icon" icon="${task.icon || "mdi:notebook-outline"}"></ha-icon>
+          <ha-icon class="task-icon" icon="${task.icon || defaultIcon}"></ha-icon>
           <div class="task-main">
             <div class="task-top-row">
               <span class="task-name-group">
-                <span class="task-name">${escapeHtml(task.name)}</span>
+                <span class="task-name">${escapeHtml(task.name)}</span>${this._assigneeChip(task)}
               </span>
             </div>
             <div class="task-lines">
-              <span class="line-item">${logRowText(task, status)}</span>
+              <span class="line-item">${lineHtml}</span>
             </div>
           </div>
           <button class="log-quick-btn" data-action="done" data-task-id="${task.id}">${escapeHtml(actionLabel)}</button>
@@ -1659,6 +2717,10 @@ class LawnMaintenanceCard extends HTMLElement {
 
   _renderTaskRow(task, data, status) {
     if (task.type === "log") return this._renderLogTaskRow(task, data, status);
+    if (task.type === "follow_up") return this._renderFollowUpRow(task, data, status);
+    if (task.type === "treatment") {
+      return this._renderQuickActionRow(task, data, status, treatmentRowText(task, status), "mdi:beaker-outline");
+    }
     const expanded = this._expandedId === task.id;
     const lastText = status.last ? formatShortYear(status.last) : "Never";
     // No "Next:" line when there's nothing actionable to show it for: never
@@ -1690,7 +2752,7 @@ class LawnMaintenanceCard extends HTMLElement {
           <div class="task-main">
             <div class="task-top-row">
               <span class="task-name-group">
-                <span class="task-name">${escapeHtml(task.name)}</span>
+                <span class="task-name">${escapeHtml(task.name)}</span>${this._assigneeChip(task)}
                 ${optionalBadge}
                 ${waterRowBadge}
               </span>
@@ -1709,7 +2771,10 @@ class LawnMaintenanceCard extends HTMLElement {
     `;
   }
 
-  _renderHistoryItem(task, entry) {
+  // `showSource`, when true, prefixes the row with the owning task's icon and
+  // name — used only when a list mixes a parent's entries with its follow-up's
+  // (see _renderDetails), so a normal single-task history is untouched.
+  _renderHistoryItem(task, entry, showSource) {
     const iso = entry.date;
     const editing = this._editingEntry && this._editingEntry.taskId === task.id && this._editingEntry.date === iso;
     const todayIso = formatISODate(todayLocal());
@@ -1743,10 +2808,13 @@ class LawnMaintenanceCard extends HTMLElement {
     // unavailable at log time.
     const snapshotsText = entrySnapshotsText(entry);
     const mediaThumb = renderMediaThumb(entry.media, "history-thumb");
+    const sourceChip = showSource
+      ? `<span class="history-source"><ha-icon icon="${task.icon || "mdi:calendar-check"}"></ha-icon>${escapeHtml(task.name)}</span>`
+      : "";
     return `
       <li>
         <div class="history-main">
-          <span class="history-date">${formatShortYear(parseISODate(iso))}${productText}${fieldsText}</span>
+          <span class="history-date">${formatShortYear(parseISODate(iso))}${sourceChip}${productText}${fieldsText}</span>
           ${snapshotsText ? `<span class="history-snapshot dim">${snapshotsText}</span>` : ""}
           ${mediaThumb}
         </div>
@@ -1774,6 +2842,46 @@ class LawnMaintenanceCard extends HTMLElement {
             : `About every ${task.target_interval_days} days`,
         ]);
       }
+    } else if (task.type === "program") {
+      infoRows.push(["Last applied", status.last ? formatShortYear(status.last) : "Never"]);
+      if (status.nextDue) infoRows.push(["Next target", formatShortYear(status.nextDue)]);
+      infoRows.push([
+        `Applications ${status.occurrenceYear}`,
+        `${status.appliedCount} of ${status.targets.length}` + (status.missedCount ? ` · ${status.missedCount} missed` : ""),
+      ]);
+      // The full schedule, with each target marked done / missed / still to
+      // come, so the whole year's plan is visible at a glance.
+      infoRows.push([
+        "Schedule",
+        status.targets
+          .map((t, i) => {
+            const state = status.satisfiedIdx.includes(i)
+              ? "applied"
+              : i === status.currentIdx
+              ? "next"
+              : status.remainingIdx.includes(i)
+              ? "to come"
+              : "missed";
+            return `${formatShort(t)} <span class="dim">— ${state}</span>`;
+          })
+          .join("<br>"),
+      ]);
+    } else if (task.type === "treatment") {
+      // No schedule rows at all — stating a next date, even as "—", would
+      // imply a recurrence this task deliberately doesn't have.
+      infoRows.push(["Last applied", status.last ? formatShortYear(status.last) : "Never"]);
+      if (status.last) infoRows.push(["Days since", String(status.daysSince)]);
+      infoRows.push(["Schedule", "On demand — no automatic next date"]);
+    } else if (task.type === "follow_up") {
+      // A follow-up has no season, interval or window of its own — it is
+      // entirely defined by the application it trails.
+      infoRows.push(["Due", status.dueDate ? formatShortYear(status.dueDate) : "—"]);
+      infoRows.push([
+        `${task.parent_name} applied`,
+        status.parentDate ? formatShortYear(status.parentDate) : "Never",
+      ]);
+      infoRows.push(["Follows", `${task.after_days} day${task.after_days === 1 ? "" : "s"} after each application`]);
+      infoRows.push(["Last completed", status.last ? formatShortYear(status.last) : "Never"]);
     } else {
       infoRows.push(["Last completed", status.last ? formatShortYear(status.last) : "Never"]);
       if (task.type === "recurring") {
@@ -1894,13 +3002,55 @@ class LawnMaintenanceCard extends HTMLElement {
       }
     }
 
+    if (task.active_ingredient) infoRows.push(["Active ingredient", escapeHtml(task.active_ingredient)]);
+    // Generic summary of whatever follow-ups this task declares — reads the
+    // same normalised list the rest of the card uses, so it covers the
+    // singular and list spellings and any number of them.
+    const detailFollowUps = followUpTasksFor(task);
+    if (detailFollowUps.length) {
+      infoRows.push([
+        detailFollowUps.length === 1 ? "Follow-up" : "Follow-ups",
+        detailFollowUps.map((f) => `${escapeHtml(f.name)} — ${f.after_days} day${f.after_days === 1 ? "" : "s"} after`).join("<br>"),
+      ]);
+    }
+    // Only offered once people are configured — with no `people:` the feature
+    // is invisible and every existing config looks exactly as it did.
+    if ((this._config.people || []).length) {
+      if (task.type === "follow_up") {
+        // A follow-up inherits its parent's assignee (see followUpTasksFor), so
+        // it is shown but not editable here: the parent's row is the one place
+        // that decides, and offering a second control would imply they could
+        // diverge.
+        infoRows.push([
+          "Assigned to",
+          `${escapeHtml(this._personName(assigneeForTask(task, "lawn-maintenance-card")))} <span class="dim">— follows ${escapeHtml(task.parent_name)}</span>`,
+        ]);
+      } else {
+        infoRows.push(["Assigned to", this._renderAssigneeSelect(task)]);
+      }
+    }
     if (task.description) infoRows.push(["Description", escapeHtml(task.description)]);
     if (task.notes) infoRows.push(["Notes", escapeHtml(task.notes)]);
     if (status.detail) infoRows.push(["Status detail", escapeHtml(status.detail)]);
     if (data.sy.length) infoRows.push(["Skipped years", data.sy.join(", ")]);
 
-    const historyHtml = data.entries.length
-      ? data.entries.map((entry) => this._renderHistoryItem(task, entry)).join("")
+    // A task that has a follow-up shows BOTH histories here, merged newest
+    // first: the pending follow-up row only exists while it's outstanding, so
+    // the parent is the one place its record stays reachable afterwards —
+    // which is also what makes an accidental completion inspectable and
+    // undoable. Each entry is rendered against the task that actually owns it,
+    // so the existing edit/delete actions already address the right entity and
+    // no second deletion path exists. Nothing is copied: both sides are read
+    // straight from their own persisted history.
+    const historyFollowUps = followUpTasksFor(task);
+    const mergedHistory = [
+      ...data.entries.map((entry) => ({ owner: task, entry })),
+      ...historyFollowUps.flatMap((followUp) =>
+        this._taskState(followUp.id).entries.map((entry) => ({ owner: followUp, entry }))
+      ),
+    ].sort((a, b) => (a.entry.date < b.entry.date ? 1 : a.entry.date > b.entry.date ? -1 : 0));
+    const historyHtml = mergedHistory.length
+      ? mergedHistory.map((row) => this._renderHistoryItem(row.owner, row.entry, !!historyFollowUps.length)).join("")
       : `<li class="dim no-history">No completions logged yet</li>`;
 
     const addAppOpen = this._addAppOpen === task.id;
@@ -1922,7 +3072,7 @@ class LawnMaintenanceCard extends HTMLElement {
 
         <div class="actions-row">
           ${hasProducts
-            ? `<button class="done-btn" data-action="toggle-add-app" data-task-id="${task.id}">LOG APPLICATION</button>`
+            ? `<button class="done-btn" data-action="toggle-add-app" data-task-id="${task.id}">${escapeHtml(task.action_label || "LOG APPLICATION")}</button>`
             : task.allow_photo
             ? `<button class="done-btn" data-action="toggle-add-app" data-task-id="${task.id}">${escapeHtml(doneLabel)}</button>
                <button class="secondary-btn" data-action="toggle-add-app" data-task-id="${task.id}">${escapeHtml(addLabel)}</button>`
@@ -1999,7 +3149,7 @@ class LawnMaintenanceCard extends HTMLElement {
             </div>` : ""}
         ` : ""}
 
-        <div class="history-label">${escapeHtml(task.history_label || "History")} (${data.h.length})</div>
+        <div class="history-label">${escapeHtml(task.history_label || "History")} (${mergedHistory.length})</div>
         <ul class="history-list">${historyHtml}</ul>
       </div>
     `;
@@ -2008,7 +3158,12 @@ class LawnMaintenanceCard extends HTMLElement {
   _renderOverview() {
     const byMonth = Array.from({ length: 12 }, () => []);
     const todayMonthIdx = todayLocal().getMonth();
-    for (const task of this._config.tasks) {
+    // Configured tasks only (follow-ups have no annual window of their own),
+    // narrowed by the same category AND assignee rules as every other view.
+    for (const task of tasksForAssignee(
+      tasksForCategory(this._config.tasks, this._activeCategory),
+      this._config.assignee
+    )) {
       const optionalBadge = task.optional ? ` <span class="optional-badge">Optional</span>` : "";
       if (task.type === "log") {
         // Log tasks are continuous activity, not an annual scheduled
@@ -2023,12 +3178,19 @@ class LawnMaintenanceCard extends HTMLElement {
         for (const m of task.active_months || []) {
           byMonth[m - 1].push(`${escapeHtml(task.name)}${optionalBadge} <span class="dim">(every ${task.interval_days}d)</span>`);
         }
+      } else if (task.type === "program") {
+        // One entry per scheduled application, in the month it falls in —
+        // whether the dates were listed explicitly or generated from an anchor.
+        for (const target of programTargetsFor(task, todayLocal().getFullYear())) {
+          byMonth[target.getMonth()].push(`${escapeHtml(task.name)}${optionalBadge} <span class="dim">(${formatShort(target)})</span>`);
+        }
       } else if (task.window) {
         for (const m of monthsOverlappingWindow(task.window)) {
           byMonth[m - 1].push(`${escapeHtml(task.name)}${optionalBadge} <span class="dim">(${task.window.start} – ${task.window.end})</span>`);
         }
       }
     }
+    if (byMonth.every((entries) => !entries.length)) return this._emptyCategoryState();
     return `
       <div class="overview">
         ${byMonth
@@ -2054,7 +3216,12 @@ class LawnMaintenanceCard extends HTMLElement {
   // history row), so there's nothing to exclude here for that.
   _renderYearHistory() {
     const events = [];
-    for (const task of this._config.tasks) {
+    // _categoryTasks so completed follow-ups appear in the journal alongside
+    // the applications that created them — "13 Aug Tree fungicide / 17 Aug
+    // Wash trees" is exactly the relationship this view should make visible —
+    // and so the journal only ever covers the selected category (a follow-up
+    // inherits its parent's, so the pair can never be split across two).
+    for (const task of this._categoryTasks()) {
       const data = this._taskState(task.id);
       for (const entry of data.entries) {
         events.push({
@@ -2062,7 +3229,7 @@ class LawnMaintenanceCard extends HTMLElement {
           dateObj: parseISODate(entry.date),
           taskName: task.name,
           icon: task.icon || "mdi:calendar-check",
-          color: taskHistoryColor(task),
+          color: taskIdentityColor(task),
           product: resolveProduct(task, entry),
           fieldsText: entryFieldsText(task.entry_fields, entry),
           fieldCount: populatedEntryFields(task.entry_fields, entry).length,
@@ -2128,7 +3295,11 @@ class LawnMaintenanceCard extends HTMLElement {
           ${sortToggle}
           <span class="dim">${summary}</span>
         </div>
-        ${yearEvents.length ? monthsHtml : `<div class="empty-state">No lawn activity recorded for ${selectedYear}.</div>`}
+        ${
+          yearEvents.length
+            ? monthsHtml
+            : `<div class="empty-state">No ${escapeHtml(this._categoryLabel(this._activeCategory))} activity recorded for ${selectedYear}.</div>`
+        }
       </div>
     `;
   }
@@ -2208,6 +3379,33 @@ const CSS = `
     cursor: pointer;
   }
   .tab.active { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+  /* Deliberately quieter than the Tasks / Year Overview / Year History tabs
+     above: outlined instead of filled, smaller type. It scopes what the tabs
+     show rather than switching between them, and should read that way. */
+  .category-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 12px 8px;
+  }
+  .category-chip {
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border: 1px solid var(--divider-color, rgba(127,127,127,0.3));
+    background: transparent;
+    color: var(--secondary-text-color);
+    border-radius: 999px;
+    padding: 3px 10px;
+    cursor: pointer;
+  }
+  .category-chip.active {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+    background: rgba(127,127,127,0.10);
+  }
   .error-banner {
     margin: 0 12px 8px;
     padding: 8px 10px;
@@ -2293,6 +3491,29 @@ const CSS = `
   }
   .task-name-group { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .task-name { font-size: 14px; font-weight: 700; color: var(--primary-text-color); }
+  /* Master-view only. Deliberately quieter than the Optional badge next to it:
+     no fill, secondary text colour, so it reads as an annotation rather than
+     competing with the task name, its due date or its status pill. */
+  .assignee-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+    opacity: 0.85;
+    /* min-width:0 + shrink lets a long name give way before the task name does
+       on a 320px phone, instead of forcing the row to overflow. */
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .assignee-chip ha-icon { --mdc-icon-size: 12px; flex-shrink: 0; }
+  /* An id that is no longer in people[]: still shown, never hidden or
+     reassigned, but marked so it is obviously something to fix. */
+  .assignee-chip.unknown { color: #b45309; opacity: 1; }
   .optional-badge {
     display: inline-flex;
     align-items: center;
@@ -2506,6 +3727,26 @@ const CSS = `
   .history-list li.no-history { justify-content: flex-start; }
   .history-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .history-snapshot { font-size: 11px; }
+  /* Which task an entry belongs to — only rendered when a history list mixes
+     a parent's entries with its follow-up's. Same muted treatment as the
+     other inline history annotations, just with the task's own icon. */
+  .history-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-left: 6px;
+    color: var(--secondary-text-color);
+    font-size: 11.5px;
+  }
+  /* Nudged up so the glyph sits on the text's optical centre — MDI glyphs
+     carry enough bottom bearing that align-items:center leaves them low. */
+  .history-source ha-icon {
+    --mdc-icon-size: 14px;
+    width: 14px;
+    height: 14px;
+    position: relative;
+    top: -3px;
+  }
   .history-thumb {
     width: 56px;
     height: 56px;
@@ -2606,7 +3847,7 @@ const CSS = `
   }
   .year-history-item:last-child { border-bottom: none; }
   /* Same stable per-task accent as the row's left border (see
-     taskHistoryColor) — deliberately NOT --status-color, since a
+     taskIdentityColor) — deliberately NOT the live status color, since a
      historical event's color must never shift as the task's current
      due/overdue/skipped status changes later. */
   .year-history-icon { --mdc-icon-size: 15px; color: var(--history-color); margin-top: -1px; flex-shrink: 0; }
@@ -2690,7 +3931,7 @@ window.customCards.push({
 // of LawnMaintenanceCard and adds nothing to it: no extra tab, no extra
 // button, no shared DOM, no shared instance state. It only reuses this
 // file's module-level pure functions (the status engine, the date helpers,
-// history normalization, taskHistoryColor) so there is exactly one
+// history normalization, taskIdentityColor) so there is exactly one
 // implementation of the recurring/seasonal/log date math in the project.
 //
 // Data sources, both already existing — nothing new is created:
@@ -2705,6 +3946,9 @@ const WEEK_DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 // Monday of the calendar week containing `date`, in local time (every date
 // helper in this file is local-midnight based, so no UTC/offset drift).
+// NOTE: the calendar's visible window is centred on today (see
+// centeredWindowStart), so the render path no longer snaps to Mondays — this
+// stays as a general date utility for building week-aligned windows.
 function mondayOf(date) {
   return addDays(date, -((date.getDay() + 6) % 7));
 }
@@ -2755,7 +3999,42 @@ function upcomingEventFor(task, status, today) {
     // gets an invented target date.
     if (!task.target_interval_days || !status.last) return null;
     const target = addDays(status.last, task.target_interval_days);
-    return target > today ? { date: target, detail: "Target" } : null;
+    return target > today ? { date: target, detail: "Target", statusKey: status.statusKey } : null;
+  }
+
+  // On-demand: nothing is ever scheduled ahead, so it contributes no upcoming
+  // marker at all. Its past applications still appear via the history loop.
+  if (task.type === "treatment") return null;
+
+  // A programme has several known target dates, so it's the one task type
+  // that returns MORE than one marker — each still-outstanding application
+  // lands on its own date. Satisfied targets simply drop out and are shown by
+  // the history loop on the day they were actually applied instead.
+  if (task.type === "program") {
+    const targets = status.targets || [];
+    return (status.remainingIdx || []).map((i) => {
+      const target = targets[i];
+      // Only the CURRENT occurrence carries the programme's computed status;
+      // the later ones are plain future targets however urgent this one is, so
+      // one overdue occurrence never reddens the rest of the season.
+      const statusKey = i === status.currentIdx ? status.statusKey : "upcoming";
+      if (target > today) return { date: target, detail: "Due", statusKey };
+      // Already passed: only the current one is folded onto today, matching
+      // how an overdue recurring task is handled below.
+      if (i !== status.currentIdx) return null;
+      return { date: today, detail: daysBetween(today, target) === 0 ? "Due today" : "Overdue", statusKey };
+    }).filter(Boolean);
+  }
+
+  if (task.type === "follow_up") {
+    // Only an OUTSTANDING follow-up is a future obligation. Once logged it
+    // stops being an upcoming marker and is represented by its own history
+    // entry on the day it was done, exactly like any other completion.
+    if (!status.pending || !status.dueDate) return null;
+    if (status.dueDate > today) return { date: status.dueDate, detail: "Due", statusKey: status.statusKey };
+    // Already due/overdue: one marker on today, matching how a recurring
+    // task's overdue date is folded onto today below.
+    return { date: today, detail: daysBetween(today, status.dueDate) === 0 ? "Due today" : "Overdue", statusKey: status.statusKey };
   }
 
   if (task.type === "seasonal") {
@@ -2763,22 +4042,39 @@ function upcomingEventFor(task, status, today) {
     // nothing to look forward to either way.
     if (["completed", "skipped", "missed_window", "optional_finished"].includes(status.statusKey)) return null;
     if (today < status.windowStart) {
-      return { date: status.windowStart, detail: optional ? "Optional · window starts" : "Window starts" };
+      return { date: status.windowStart, detail: optional ? "Optional · window starts" : "Window starts", statusKey: status.statusKey };
     }
     // Inside the window: one marker on TODAY only, never repeated per day.
     if (today <= status.windowEnd) {
-      return { date: today, detail: optional ? "Optional · available" : "Available now" };
+      return { date: today, detail: optional ? "Optional · available" : "Available now", statusKey: status.statusKey };
     }
     return null;
   }
 
   // Recurring. Out of season contributes nothing at all (an optional task
   // that is merely inactive must not show up just to fill a cell).
-  if (status.statusKey === "inactive" || status.statusKey === "optional_finished") return null;
-  if (!status.nextDue) return { date: today, detail: optional ? "Optional · available" : "Recommended" };
-  if (status.nextDue > today) return { date: status.nextDue, detail: optional ? "Optional" : "Due" };
-  if (optional) return { date: today, detail: "Optional · available" };
-  return { date: today, detail: daysBetween(today, status.nextDue) === 0 ? "Due today" : "Overdue" };
+  if (
+    status.statusKey === "inactive" ||
+    status.statusKey === "optional_finished" ||
+    // Same "contributes nothing" reasoning — these are just the optional
+    // recurring spellings of out-of-season (see applyOptionalRemap).
+    status.statusKey === "optional_inactive" ||
+    status.statusKey === "optional_season_over"
+  ) return null;
+  if (!status.nextDue) return { date: today, detail: optional ? "Optional · available" : "Recommended", statusKey: status.statusKey };
+  if (status.nextDue > today) return { date: status.nextDue, detail: optional ? "Optional" : "Due", statusKey: status.statusKey };
+  if (optional) return { date: today, detail: "Optional · available", statusKey: status.statusKey };
+  return { date: today, detail: daysBetween(today, status.nextDue) === 0 ? "Due today" : "Overdue", statusKey: status.statusKey };
+}
+
+// The visible window is centred on today rather than snapped to a calendar
+// week: with 7 cells that puts today in the exact middle, three days of
+// context either side. Navigation still moves in whole weeks (offset * 7), so
+// prev/next feel unchanged while the centre stays the anchor.
+const WEEK_SPAN_DAYS = 7;
+
+function centeredWindowStart(today, weekOffset) {
+  return addDays(today, weekOffset * WEEK_SPAN_DAYS - Math.floor(WEEK_SPAN_DAYS / 2));
 }
 
 // Builds the 7 day cells. Pure: tasks in, a state-lookup callback in, plain
@@ -2789,28 +4085,39 @@ function upcomingEventFor(task, status, today) {
 // never because a schedule says something should have happened.
 function buildWeekEvents(tasks, dataFor, weekStart, today) {
   const days = [];
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < WEEK_SPAN_DAYS; i++) {
     const date = addDays(weekStart, i);
     days.push({
       date,
       iso: formatISODate(date),
-      dow: WEEK_DAY_ABBR[i],
+      // From the DATE, never from the cell index: the window is centred on
+      // today, so cell 0 is whatever weekday falls three days back — it is
+      // only a Monday one day in seven.
+      dow: WEEK_DAY_ABBR[(date.getDay() + 6) % 7],
       isToday: formatISODate(date) === formatISODate(today),
       events: [],
     });
   }
   const byIso = new Map(days.map((d) => [d.iso, d]));
 
-  for (const task of tasks) {
+  // Same expansion the planner card uses, so a pending follow-up shows up
+  // here too — synthesis lives in withFollowUps(), never duplicated.
+  for (const task of withFollowUps(tasks)) {
     const data = dataFor(task.id);
+    const parentData = task.type === "follow_up" ? dataFor(task.parent_id) : null;
     const base = {
       taskId: task.id,
       taskName: task.name,
       icon: task.icon || "mdi:calendar-check",
-      // Stable identity color from the task itself (see taskHistoryColor) —
-      // never from today's computed status, so a cell's colors never shift
+      // The task's own stable identity color (see taskIdentityColor), used
+      // as-is for recorded history and as the base for upcoming markers — a
+      // marker whose status carries meaning overrides it (eventDisplayColor).
+      // Kept stable for history so a past entry's color never shifts
       // as a task later becomes due or overdue.
-      color: taskHistoryColor(task),
+      color: taskIdentityColor(task),
+      // Carried on every event so the unrestricted calendar can label rows
+      // without re-deriving which task they came from.
+      category: categoryForTask(task),
     };
 
     for (const entry of data.entries) {
@@ -2824,35 +4131,50 @@ function buildWeekEvents(tasks, dataFor, weekStart, today) {
       day.events.push({ ...base, kind: "history", detail: product ? product.name : compactEntryDetail(task, entry) });
     }
 
-    const upcoming = upcomingEventFor(task, computeTaskStatus(task, data, today), today);
-    if (upcoming) {
-      const day = byIso.get(formatISODate(upcoming.date));
-      if (day) day.events.push({ ...base, kind: "upcoming", detail: upcoming.detail });
+    // Most task types contribute at most one upcoming marker; a programme
+    // returns one per outstanding target, so normalise to a list here rather
+    // than making every other branch return an array.
+    const upcoming = upcomingEventFor(task, computeTaskStatus(task, data, today, parentData), today);
+    for (const event of Array.isArray(upcoming) ? upcoming : upcoming ? [upcoming] : []) {
+      const day = byIso.get(formatISODate(event.date));
+      if (!day) continue;
+      // Per EVENT, never per day: one overdue marker in a cell must not
+      // recolor the other tasks sharing that day.
+      const style = eventDisplayColor(task, event.statusKey);
+      day.events.push({
+        ...base,
+        kind: "upcoming",
+        detail: event.detail,
+        statusKey: event.statusKey,
+        color: style.color,
+        attention: style.attention,
+      });
     }
   }
 
   return days;
 }
 
-// Depth-first search for the first custom:lawn-maintenance-card config in a
-// Lovelace dashboard config. Walks generically (views / sections / cards /
-// stacks / grids / anything nesting) so it keeps working regardless of how
-// the dashboard is laid out around the card.
-function findLawnMaintenanceConfig(node) {
+// Depth-first search for EVERY custom:lawn-maintenance-card config in a
+// Lovelace dashboard config, in document order. Walks generically (views /
+// sections / cards / stacks / grids / anything nesting) so it keeps working
+// regardless of how the dashboard is laid out around the cards.
+//
+// All of them, not just the first, because one card per category is a
+// supported (and intended) layout: an unrestricted week calendar has to see
+// every category's tasks, and it can only do that by reading every card.
+function findLawnMaintenanceConfigs(node, out = []) {
   if (Array.isArray(node)) {
-    for (const child of node) {
-      const hit = findLawnMaintenanceConfig(child);
-      if (hit) return hit;
-    }
-    return null;
+    for (const child of node) findLawnMaintenanceConfigs(child, out);
+    return out;
   }
-  if (!node || typeof node !== "object") return null;
-  if (node.type === "custom:lawn-maintenance-card" && Array.isArray(node.tasks)) return node;
-  for (const value of Object.values(node)) {
-    const hit = findLawnMaintenanceConfig(value);
-    if (hit) return hit;
+  if (!node || typeof node !== "object") return out;
+  if (node.type === "custom:lawn-maintenance-card" && Array.isArray(node.tasks)) {
+    out.push(node);
+    return out;
   }
-  return null;
+  for (const value of Object.values(node)) findLawnMaintenanceConfigs(value, out);
+  return out;
 }
 
 class LawnWeekCalendar extends HTMLElement {
@@ -2870,7 +4192,20 @@ class LawnWeekCalendar extends HTMLElement {
       // Only needed when the maintenance card lives on a *different*
       // dashboard than this card.
       sourceDashboard: typeof cfg.source_dashboard === "string" ? cfg.source_dashboard : null,
+      // Unlike the maintenance card, the calendar has no selector and omitting
+      // `category:` is meaningful: no category = the master calendar across
+      // every category. Set it and the calendar is filtered to that one, with
+      // no way to change it at runtime.
+      category: typeof cfg.category === "string" && cfg.category.trim() ? cfg.category.trim() : null,
+      categoryLabels: buildCategoryLabels(cfg),
+      // Same option, same meaning, same shared filter as the planner card, so a
+      // person's week matches their task list exactly. Absent = all.
+      assignee: typeof cfg.assignee === "string" && cfg.assignee.trim() ? cfg.assignee.trim() : ASSIGNEE_ALL,
     };
+    // Labels found on the maintenance card(s) this calendar reads its tasks
+    // from, so category names do not have to be repeated in the calendar's own
+    // YAML. Its own `category_labels:` still wins — see _categoryLabel.
+    this._discoveredCategoryLabels = {};
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     this._built = false;
     // Weeks away from the week containing today. Only ever changed by the
@@ -2923,6 +4258,28 @@ class LawnWeekCalendar extends HTMLElement {
     return this._config.tasks || this._discovered;
   }
 
+  // The tasks this calendar is built from: every category when none is
+  // configured, otherwise just the configured one. Filtering the configured
+  // list (rather than the follow-up-expanded one) is equivalent and keeps
+  // buildWeekEvents unchanged — a follow-up always carries its parent's
+  // category, so a parent that is filtered out takes its follow-ups with it.
+  // Used by BOTH _renderBody and _computeSignature, so what is drawn and what
+  // triggers a redraw can never disagree.
+  _effectiveTasks() {
+    const tasks = this._tasks();
+    if (!tasks) return null;
+    // Category first, then assignee — the identical pair the planner card
+    // applies in _categoryTasks, through the identical helpers, so the two
+    // views can never disagree about whose week this is. Filtering the
+    // configured list is enough: a follow-up inherits both properties from its
+    // parent, so a parent that is filtered out takes its follow-ups with it.
+    return tasksForAssignee(tasksForCategory(tasks, this._config.category), this._config.assignee);
+  }
+
+  _categoryLabel(id) {
+    return categoryLabel(id, { ...this._discoveredCategoryLabels, ...this._config.categoryLabels });
+  }
+
   // Which dashboard to read the task config from: an explicit
   // source_dashboard, else the dashboard this card is currently displayed on
   // (the first path segment, e.g. /my-dashboard/schedule -> my-dashboard).
@@ -2957,13 +4314,29 @@ class LawnWeekCalendar extends HTMLElement {
     }
 
     if (lovelaceConfig) {
-      const found = findLawnMaintenanceConfig(lovelaceConfig);
-      if (!found) {
+      const found = findLawnMaintenanceConfigs(lovelaceConfig);
+      if (!found.length) {
         this._discoveryError =
           "No lawn-maintenance-card found on this dashboard. Add one, set `source_dashboard:` to the dashboard that has it, or give this card its own `tasks:` list.";
       } else {
         try {
-          this._discovered = normalizeTaskConfig(found.tasks, "lawn-week-calendar");
+          // Every maintenance card on the dashboard, merged in document order.
+          // Each card's list is normalized on its own (so its own duplicate ids
+          // still error), then merged by id: the same task listed on two cards
+          // is one task, not two rows on the same day.
+          const merged = [];
+          const seen = new Set();
+          const labels = {};
+          for (const cardConfig of found) {
+            Object.assign(labels, buildCategoryLabels(cardConfig));
+            for (const task of normalizeTaskConfig(cardConfig.tasks, "lawn-week-calendar")) {
+              if (seen.has(task.id)) continue;
+              seen.add(task.id);
+              merged.push(task);
+            }
+          }
+          this._discovered = merged;
+          this._discoveredCategoryLabels = labels;
           this._discoveryError = null;
         } catch (err) {
           this._discoveryError = err.message;
@@ -3024,9 +4397,20 @@ class LawnWeekCalendar extends HTMLElement {
   // polling. The date and the selected week are part of the signature so a
   // midnight rollover and the nav buttons also repaint.
   _computeSignature() {
-    const tasks = this._tasks();
+    // The category-effective collection, so a filtered calendar is not woken
+    // by writes in a category it does not show — and an unrestricted one still
+    // reacts to every category, because nothing is filtered out of it.
+    const tasks = this._effectiveTasks();
     if (!tasks) return `unresolved:${this._discovering}:${this._discoveryError || ""}`;
-    const taskSig = tasks
+    // MUST be the same effective collection buildWeekEvents() renders from —
+    // withFollowUps(), not the raw configured list. A follow-up's completions
+    // live in their own pyscript.lawn_<parent>_fu_<id> entity, so a wash being
+    // logged, deleted or re-dated only ever moves THAT entity's last_updated.
+    // Signing just the configured tasks left the signature unchanged for those
+    // writes, _scheduleRender() short-circuited, and the calendar kept showing
+    // a pending row it had already been told was gone. Going through the same
+    // helper means any future synthesized task type is picked up automatically.
+    const taskSig = withFollowUps(tasks)
       .map((t) => {
         const st = this._hass.states[`pyscript.lawn_${t.id}`];
         return st ? `${t.id}:${st.last_updated}` : `${t.id}:none`;
@@ -3043,8 +4427,15 @@ class LawnWeekCalendar extends HTMLElement {
       const action = el.dataset.action;
       if (action === "prev-week") this._weekOffset -= 1;
       else if (action === "next-week") this._weekOffset += 1;
-      else if (action === "today-week") this._weekOffset = 0;
-      else return;
+      else if (action === "today-week") {
+        this._weekOffset = 0;
+        // Re-centre even when the window is already today's: the user may have
+        // scrolled the strip by hand, and Today must undo that too. Clearing
+        // both keys forces _renderBody past its "same week, keep the scroll"
+        // shortcut and past the signature short-circuit.
+        this._scrolledWeekKey = null;
+        this._lastSignature = null;
+      } else return;
       this._scheduleRender();
     });
   }
@@ -3058,7 +4449,7 @@ class LawnWeekCalendar extends HTMLElement {
   _renderBody() {
     const root = this.shadowRoot.querySelector(".lwc-root");
     if (!root) return;
-    const tasks = this._tasks();
+    const tasks = this._effectiveTasks();
     const titleHtml = this._config.title ? `<div class="lwc-title">${escapeHtml(this._config.title)}</div>` : "";
 
     if (!tasks) {
@@ -3069,14 +4460,21 @@ class LawnWeekCalendar extends HTMLElement {
     }
 
     const today = todayLocal();
-    const weekStart = addDays(mondayOf(today), this._weekOffset * 7);
-    const weekEnd = addDays(weekStart, 6);
+    const weekStart = centeredWindowStart(today, this._weekOffset);
+    const weekEnd = addDays(weekStart, WEEK_SPAN_DAYS - 1);
     const days = buildWeekEvents(
       tasks,
       (taskId) => normalizeTaskState(this._hass.states[`pyscript.lawn_${taskId}`]),
       weekStart,
       today
     );
+
+    // A filtered calendar never repeats its one category on every row. An
+    // unrestricted one only labels rows once there is actually something to
+    // tell apart — with every task in a single category the marker would be
+    // noise on every line, and it starts appearing by itself the moment a
+    // second category has tasks.
+    const showCategories = !this._config.category && distinctCategories(tasks).length > 1;
 
     // Preserve wherever the user had scrolled to when a live state update
     // repaints the same week; only a week change re-positions the strip.
@@ -3097,7 +4495,7 @@ class LawnWeekCalendar extends HTMLElement {
         </button>
       </div>
       <div class="week-strip" role="list">
-        ${days.map((day) => this._renderDay(day)).join("")}
+        ${days.map((day) => this._renderDay(day, showCategories)).join("")}
       </div>`;
 
     const strip = root.querySelector(".week-strip");
@@ -3130,16 +4528,28 @@ class LawnWeekCalendar extends HTMLElement {
     }
     const scrollable = strip.scrollWidth - strip.clientWidth > 1;
     const todayEl = this._weekOffset === 0 ? strip.querySelector(".lwc-day.is-today") : null;
-    strip.scrollLeft = scrollable && todayEl ? todayEl.offsetLeft : 0;
+    if (!scrollable || !todayEl) {
+      // Everything fits (or we're on another week): the window is already
+      // centred on today by construction, so start at the left edge.
+      strip.scrollLeft = 0;
+      return;
+    }
+    // Narrow enough to scroll: put today's MIDDLE at the viewport's middle
+    // rather than flush left, so the same "today in the centre" reading holds
+    // when only two or three cells fit. Clamped to the real scroll range, so
+    // the first/last few days still land as close to centre as they can.
+    const target = todayEl.offsetLeft + todayEl.offsetWidth / 2 - strip.clientWidth / 2;
+    strip.scrollLeft = Math.max(0, Math.min(target, strip.scrollWidth - strip.clientWidth));
   }
 
-  _renderDay(day) {
+  _renderDay(day, showCategories) {
     const eventsHtml = day.events
       .map(
         (e) => `
-        <div class="lwc-event ${e.kind === "upcoming" ? "is-upcoming" : "is-history"}" style="--lwc-event-color:${e.color}">
+        <div class="lwc-event ${e.kind === "upcoming" ? "is-upcoming" : "is-history"}${e.attention ? " is-attention" : ""}" style="--lwc-event-color:${e.color}">
           <ha-icon class="lwc-event-icon" icon="${e.icon}"></ha-icon>
           <div class="lwc-event-text">
+            ${showCategories ? `<div class="lwc-event-cat">${escapeHtml(this._categoryLabel(e.category))}</div>` : ""}
             <div class="lwc-event-name">${escapeHtml(e.taskName)}</div>
             ${e.detail ? `<div class="lwc-event-detail">${escapeHtml(e.detail)}</div>` : ""}
           </div>
@@ -3246,7 +4656,13 @@ const WEEK_CALENDAR_CSS = `
   .week-strip::-webkit-scrollbar { display: none; }
 
   .lwc-day {
-    scroll-snap-align: start;
+    /* Centre, not start: the window is built around today (see
+       centeredWindowStart), and a start-aligned mandatory snap would drag any
+       centred scroll position back to a cell's left edge — making "today in the
+       middle" impossible on a strip narrow enough to scroll. Snapping to the
+       centre keeps both the programmatic positioning and the user's own swipes
+       agreeing on where a day belongs. */
+    scroll-snap-align: center;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -3319,6 +4735,19 @@ const WEEK_CALENDAR_CSS = `
     margin-top: 1px;
   }
   .lwc-event-text { min-width: 0; }
+  /* Only ever rendered by the unrestricted calendar, and only once more than
+     one category is present — a quiet overline, not a badge competing with
+     the task name. */
+  .lwc-event-cat {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    line-height: 1.2;
+    color: var(--secondary-text-color);
+    opacity: 0.75;
+    overflow-wrap: anywhere;
+  }
   .lwc-event-name {
     font-size: 11.5px;
     font-weight: 600;
@@ -3331,6 +4760,16 @@ const WEEK_CALENDAR_CSS = `
     line-height: 1.25;
     color: var(--secondary-text-color);
     overflow-wrap: anywhere;
+  }
+  /* A marker whose status needs attention (see eventDisplayColor): the accent
+     and icon already follow --lwc-event-color, which now holds the STATUS
+     color rather than the task's identity color, so only the status text needs
+     saying explicitly. Deliberately scoped to the event — the day cell keeps
+     its normal background and its orange Today border, and the task NAME keeps
+     the normal text color, exactly as on the planner card's rows. */
+  .lwc-event.is-attention .lwc-event-detail {
+    color: var(--lwc-event-color);
+    font-weight: 600;
   }
 
   /* Roughly two day cards in view on a phone, the rest a swipe away. */
