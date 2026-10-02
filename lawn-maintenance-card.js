@@ -23,7 +23,7 @@
 // cache this file by URL, so overwriting it in place is often not enough
 // for a change to actually take effect.
 
-const CARD_VERSION = "51";
+const CARD_VERSION = "52";
 // eslint-disable-next-line no-console
 console.info(
   `%c LAWN-MAINTENANCE-CARD %c v${CARD_VERSION} `,
@@ -1466,6 +1466,12 @@ function activeLockouts(tasks, dataFor, today) {
     out.push({
       sourceId: task.id,
       sourceName: task.name,
+      // Days this task already has a real history entry on. The band skips
+      // them: on the day you logged the overseeding, the logged entry is
+      // already saying "Overseeding" in that cell, and a "Day 1 of 30"
+      // marker beside it is the same task twice. Covers a re-seed mid-band
+      // for free, since that day gets its own entry too.
+      loggedDates: new Set((data.entries || []).map((e) => e.date)),
       label: task.lockout.label || task.name,
       category: categoryForTask(task),
       scope: task.lockout.scope,
@@ -4209,10 +4215,18 @@ function upcomingEventFor(task, status, today, lockouts) {
     const markers = [];
     for (let i = 0; i < source.totalDays; i++) {
       const date = addDays(source.start, i);
+      // The logged entry already represents this task on this day.
+      if (source.loggedDates.has(formatISODate(date))) continue;
       markers.push({
         date,
         detail: `Day ${i + 1} of ${source.totalDays}`,
         statusKey: "lockout_day",
+        // A day of the period that has already happened is a fact, not a
+        // forecast, so it draws solid like any other recorded event; only
+        // the days still ahead stay dashed. Without this the whole band —
+        // including days you have already lived through — renders as
+        // "planned", which reads as though the hold had not started.
+        kind: date <= today ? "history" : "upcoming",
       });
     }
     return markers;
@@ -4379,7 +4393,10 @@ function buildWeekEvents(tasks, dataFor, weekStart, today) {
       const style = eventDisplayColor(task, event.statusKey);
       day.events.push({
         ...base,
-        kind: "upcoming",
+        // Almost everything here is genuinely a forecast, so "upcoming" is
+        // the default; an event may override it when part of what it marks
+        // has already happened (a lockout band spans both sides of today).
+        kind: event.kind || "upcoming",
         detail: event.detail,
         statusKey: event.statusKey,
         color: style.color,
