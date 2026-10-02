@@ -90,6 +90,42 @@ tasks:
       end: "09-30"
     description: "Core aeration to relieve soil compaction before overseeding"
 
+  # --- Lockout / establishment period -----------------------------------
+  # Some jobs make the lawn untouchable for a while afterwards: once you
+  # overseed, the seedbed needs roughly a month before it can take
+  # fertilizer, spray or a mower again. `lockout:` says so, and from the day
+  # the task is logged until `days` later every other task in scope stops
+  # claiming your attention.
+  #
+  # What it suppresses: PREDICTIONS only — due, overdue, "available now",
+  # and a log task's target_interval_days nudge. Held tasks move to an "On
+  # hold" section reading e.g. "On hold · Overseeding day 4 of 30 · until
+  # 29 Oct", and drop their markers from the week calendar.
+  #
+  # What it never touches: HISTORY, and your ability to log. Everything
+  # stays fully loggable throughout and anything you actually do still shows
+  # as done — which is the point, because irrigation and lawn-condition
+  # logging are exactly what you keep doing during establishment.
+  #
+  # The task running the lockout paints a "Day N of M" marker on every day
+  # of the period in the week calendar, so the hold reads as a countdown you
+  # can follow rather than as a mysteriously empty strip.
+  #
+  #   days:   how long it lasts, counted from the logged date (day 1).
+  #   scope:  "category" (default — the source task's own category, so
+  #           overseeding the lawn says nothing about when the AC filter is
+  #           due), "all", or an explicit list of task ids.
+  #   exempt: optional task ids that carry on as normal.
+  #   label:  wording for the hold text and the daily marker (defaults to
+  #           the task's name).
+  #
+  # `lockout_days: 30` is accepted as shorthand for `lockout: {days: 30}`.
+  #
+  # To end a hold early, set a `lockout_until` field on the logged entry
+  # (via the existing edit-history service) — it overrides `days`. No
+  # backend change is needed for this; it rides on the per-entry `fields`
+  # that lawn_edit_history_entry already stores.
+
   - id: overseeding
     name: Overseeding
     type: seasonal
@@ -97,6 +133,9 @@ tasks:
     window:
       start: "09-05"
       end: "09-25"
+    lockout:
+      days: 30
+      label: Overseeding
     notes: "Do shortly after aeration for best seed-to-soil contact"
 
   - id: autumn_fertilizer

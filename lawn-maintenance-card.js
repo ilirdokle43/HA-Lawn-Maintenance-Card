@@ -23,7 +23,7 @@
 // cache this file by URL, so overwriting it in place is often not enough
 // for a change to actually take effect.
 
-const CARD_VERSION = "32";
+const CARD_VERSION = "51";
 // eslint-disable-next-line no-console
 console.info(
   `%c LAWN-MAINTENANCE-CARD %c v${CARD_VERSION} `,
@@ -138,19 +138,22 @@ function escapeHtml(str) {
 // applyOptionalRemap.
 const INACTIVE_THRESHOLD_DAYS = 30;
 
-const SECTION_ORDER = ["needs_attention", "upcoming", "logs", "optional", "season_finished", "inactive"];
+const SECTION_ORDER = ["needs_attention", "upcoming", "logs", "on_hold", "optional", "season_finished", "inactive"];
 const SECTION_LABELS = {
   needs_attention: "Needs attention",
   upcoming: "Upcoming",
   logs: "Activity",
+  on_hold: "On hold",
   optional: "Optional",
   season_finished: "Season finished",
   inactive: "Inactive",
 };
 // Sections collapsed by default when a task list first renders — low-priority
-// sections stay out of the way until the user asks to see them.
-const DEFAULT_COLLAPSED_SECTIONS = ["optional", "season_finished", "inactive"];
-const COLLAPSIBLE_SECTIONS = new Set(["optional", "season_finished", "inactive"]);
+// sections stay out of the way until the user asks to see them. "on hold" is
+// collapsed too: the whole point of a lockout is that those tasks stop
+// competing for attention, and the lockout's own task shows the countdown.
+const DEFAULT_COLLAPSED_SECTIONS = ["on_hold", "optional", "season_finished", "inactive"];
+const COLLAPSIBLE_SECTIONS = new Set(["on_hold", "optional", "season_finished", "inactive"]);
 
 const STATUS_META = {
   overdue: { color: "#ef4444", icon: "mdi:alert-circle", section: "needs_attention", rank: 0 },
@@ -201,6 +204,17 @@ const STATUS_META = {
   // simply not rendered — see _renderTasks. The entry exists so the section
   // lookup can never fall through to the "inactive" default.
   follow_up_done: { color: "#10b981", icon: "mdi:check-circle", section: "season_finished", rank: 4 },
+  // A task silenced by another task's lockout window (see applyLockoutRemap).
+  // Deliberately grey and calm: it is not overdue, not missed, and nothing is
+  // wrong — it is simply not allowed to be done right now. The row stays
+  // visible and fully loggable; only its claim on your attention is removed.
+  on_hold: { color: "#94a3b8", icon: "mdi:pause-circle-outline", section: "on_hold", rank: 0 },
+  // The daily "day N of M" marker the lockout's OWN task paints across the
+  // week calendar for every day of its window, so the period reads as a
+  // visible band you can count rather than an absence of other markers.
+  // Its own section (not logs/upcoming) so eventDisplayColor gives it this
+  // colour instead of the source task's identity colour.
+  lockout_day: { color: "#a855f7", icon: "mdi:progress-clock", section: "on_hold", rank: 1 },
 };
 
 // Maps a normally-computed seasonal statusKey onto its optional-task
@@ -705,7 +719,12 @@ function logRowText(task, status) {
   const dateText = formatShortYear(status.last);
   const relative = relativeDayLabel(status.daysSince);
   let targetClause = "";
-  if (task.target_interval_days) {
+  if (status.lockedOut) {
+    // The target is suspended, not merely not-yet-reached, so neither "may be
+    // due" nor "target 5 days" is true right now — say what is actually
+    // going on instead. Mowing during overseeding is the motivating case.
+    targetClause = ` · <span class="dim">on hold · ${escapeHtml(status.lockedOut.label)} until ${formatShort(status.lockedOut.end)}</span>`;
+  } else if (task.target_interval_days) {
     targetClause = status.daysSince >= task.target_interval_days
       ? ` · ${escapeHtml(task.name)} may be due`
       : ` · target ${task.target_interval_days} days`;
@@ -1179,6 +1198,36 @@ function warnUnknownAssignees(tasks, people, cardName) {
 // has not been through anyone's setConfig, so it has to run the exact same
 // normalization or a task without an explicit `id` would resolve to a
 // different entity in each card.
+// Accepts either the full block or the `lockout_days: 30` shorthand and
+// returns {lockout} / {} to spread onto the task. Validated here, once, so a
+// typo surfaces as a console warning at config time rather than as a lockout
+// that silently never fires. Returns {} — not a disabled lockout — when the
+// task declares none, so `task.lockout` stays undefined for the vast majority
+// of tasks and every check downstream is a plain truthiness test.
+function normalizeLockoutConfig(t, id, cardName) {
+  const raw = t.lockout || (t.lockout_days ? { days: t.lockout_days } : null);
+  if (!raw) return {};
+  const days = Number(raw.days);
+  if (!Number.isFinite(days) || days <= 0) {
+    // eslint-disable-next-line no-console
+    console.warn(`${cardName}: task "${id}" has a lockout with no usable days (${JSON.stringify(raw.days)}) — ignoring it.`);
+    return {};
+  }
+  const scope = raw.scope === undefined ? "category" : raw.scope;
+  if (!Array.isArray(scope) && scope !== "category" && scope !== "all") {
+    // eslint-disable-next-line no-console
+    console.warn(`${cardName}: task "${id}" has lockout.scope "${scope}" — expected "category", "all", or a list of task ids. Falling back to "category".`);
+  }
+  return {
+    lockout: {
+      days,
+      scope: Array.isArray(scope) || scope === "all" ? scope : "category",
+      exempt: Array.isArray(raw.exempt) ? raw.exempt : undefined,
+      label: raw.label || t.name || id,
+    },
+  };
+}
+
 function normalizeTaskConfig(tasks, cardName) {
   const seen = new Set();
   const normalized = tasks.map((t, i) => {
@@ -1201,7 +1250,7 @@ function normalizeTaskConfig(tasks, cardName) {
           return { ...p, id: pid };
         })
       : undefined;
-    return { ...t, id, optional: !!t.optional, allow_photo: !!t.allow_photo, ...(products ? { products } : {}) };
+    return { ...t, id, optional: !!t.optional, allow_photo: !!t.allow_photo, ...(products ? { products } : {}), ...normalizeLockoutConfig(t, id, cardName) };
   });
 
   // Identity colors are allocated across the WHOLE list at once — including the
@@ -1363,9 +1412,131 @@ const OPTIONAL_SEASON_ENDED_KEYS = new Set(["optional_finished", "completed", "s
 // 24 Sep" already reads calmly, and the row keeps its Optional badge.
 const OPTIONAL_OWN_SECTION_KEYS = new Set(["optional_inactive", "optional_season_over", "season_inactive"]);
 
+// Lockouts — an "establishment period". Some jobs make the lawn untouchable
+// for a while afterwards: overseed it and for the next month you must not
+// fertilize, spray or even mow, because the seedbed is still knitting in.
+// A task declares that with:
+//
+//   lockout:
+//     days: 30               # how long the period lasts, from the log date
+//     scope: category        # "category" (default) | "all" | [task ids]
+//     exempt: [some_task]    # optional ids that carry on as normal
+//     label: Overseeding     # wording for the hold text and daily marker
+//
+// `lockout_days: 30` is accepted as shorthand for `lockout: {days: 30}`.
+//
+// What a lockout does and does NOT do is the whole design:
+//   - It suppresses PREDICTIONS (due / overdue / available / target markers).
+//   - It never touches HISTORY. Anything actually done still shows as done,
+//     and every task stays fully loggable throughout — you still record
+//     irrigation and lawn condition during establishment, and those entries
+//     appear exactly as they always did.
+// That split is why a locked-out task keeps its row instead of vanishing.
+
+// A lockout started by `entry` ends `days` later, unless that entry carries an
+// explicit `lockout_until` field — which is how "end the hold early" is
+// stored, via the existing lawn_edit_history_entry service and its per-entry
+// `fields`. No backend change was needed for it.
+function lockoutEndFor(task, entry, startDate) {
+  const explicit = entry && entry.fields ? entry.fields.lockout_until : null;
+  if (explicit) {
+    const parsed = parseISODate(explicit);
+    if (parsed && !Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return addDays(startDate, task.lockout.days);
+}
+
+// Every lockout covering `today`, newest first. A task can only be locking
+// things down off the back of a real history entry, so a lockout that was
+// never logged simply does not exist.
+function activeLockouts(tasks, dataFor, today) {
+  const out = [];
+  for (const task of tasks) {
+    if (!task.lockout || !task.lockout.days) continue;
+    const data = dataFor(task.id);
+    if (!data || !data.entries || !data.entries.length) continue;
+    // entries are newest-first; the most recent one is the only one that can
+    // still be running, so an overseeding done last autumn never re-arms.
+    const entry = data.entries[0];
+    const start = parseISODate(entry.date);
+    if (!start || Number.isNaN(start.getTime())) continue;
+    const end = lockoutEndFor(task, entry, start);
+    if (today < start || today >= end) continue;
+    const totalDays = Math.max(1, daysBetween(start, end));
+    out.push({
+      sourceId: task.id,
+      sourceName: task.name,
+      label: task.lockout.label || task.name,
+      category: categoryForTask(task),
+      scope: task.lockout.scope,
+      exempt: task.lockout.exempt,
+      start,
+      end,
+      totalDays,
+      // Day 1 is the day it was logged, which is how you'd count it out loud.
+      dayIndex: daysBetween(start, today) + 1,
+    });
+  }
+  return out;
+}
+
+// Does `lockout` silence `task`? A lockout never silences the task that
+// started it (you must still be able to see and correct the overseeding
+// itself), and never reaches outside its declared scope — which defaults to
+// the source task's own category, so overseeding the lawn says nothing about
+// when the AC filter is due.
+function lockoutSilences(lockout, task) {
+  if (task.id === lockout.sourceId) return false;
+  if (task.parent_id === lockout.sourceId) return false;
+  if (Array.isArray(lockout.exempt) && lockout.exempt.includes(task.id)) return false;
+  if (Array.isArray(lockout.scope)) return lockout.scope.includes(task.id);
+  if (lockout.scope === "all") return true;
+  return categoryForTask(task) === lockout.category;
+}
+
+// The lockout silencing this task, or null. First match wins; with more than
+// one running the earliest-ending is irrelevant, since any single active
+// lockout is enough to hold the task.
+function lockoutFor(lockouts, task) {
+  if (!lockouts || !lockouts.length) return null;
+  return lockouts.find((l) => lockoutSilences(l, task)) || null;
+}
+
+function lockoutHoldLabel(lockout) {
+  return `On hold · ${escapeHtml(lockout.label)} day ${lockout.dayIndex} of ${lockout.totalDays} · until ${formatShort(lockout.end)}`;
+}
+
+// Statuses a lockout must leave exactly as they are: all of them report
+// something that already HAPPENED, and a lockout only ever suppresses what is
+// predicted. Holding a completed task would be rewriting history.
+const LOCKOUT_PASSTHROUGH_KEYS = new Set([
+  "completed", "skipped", "missed_window", "follow_up_done", "optional_finished",
+]);
+
+function applyLockoutRemap(task, status, lockout) {
+  if (!lockout) return status;
+  if (LOCKOUT_PASSTHROUGH_KEYS.has(status.statusKey)) return status;
+  // A log task has no due/overdue concept to suppress (computeLogStatus), and
+  // several of them — irrigation, rainfall, lawn condition — are exactly what
+  // you go on recording DURING an establishment period. They keep their row,
+  // their section and their pin; `lockedOut` only tells logRowText to drop
+  // the "may be due" nudge a target_interval_days would otherwise print, and
+  // upcomingEventFor to stop drawing that target on the calendar.
+  if (task.type === "log") return { ...status, lockedOut: lockout };
+  return {
+    ...status,
+    statusKey: "on_hold",
+    label: lockoutHoldLabel(lockout),
+    lockedOut: lockout,
+  };
+}
+
 // `parentData` is only used by follow-up tasks, which need their parent's
 // history to know what they are following and whether they are still pending.
-function computeTaskStatus(task, data, today, parentData) {
+// `lockout` is the active lockout silencing this task, or null — resolved by
+// the caller via lockoutFor() so the lockout set is computed once per render
+// rather than per task.
+function computeTaskStatus(task, data, today, parentData, lockout) {
   let status;
   if (task.type === "seasonal") status = computeSeasonalStatus(task, data, today);
   else if (task.type === "log") status = computeLogStatus(task, data, today);
@@ -1374,6 +1545,10 @@ function computeTaskStatus(task, data, today, parentData) {
   else if (task.type === "follow_up") status = computeFollowUpStatus(task, data, parentData, today);
   else status = computeRecurringStatus(task, data, today);
   status = applyOptionalRemap(task, status, today);
+  // After the optional remap, not before: a lockout outranks "optional ·
+  // available" just as it outranks "overdue", and both must land on the same
+  // calm hold rather than one of them keeping its own wording.
+  status = applyLockoutRemap(task, status, lockout);
   const meta = STATUS_META[status.statusKey] || STATUS_META.inactive;
   // Belt-and-suspenders: even if a future statusKey slipped through the
   // remap above without being reassigned, an optional task must never be
@@ -1390,6 +1565,11 @@ function computeTaskStatus(task, data, today, parentData) {
   // flag has no meaning for them (see applyOptionalRemap).
   let section;
   if (task.type === "log") {
+    section = meta.section;
+  } else if (status.statusKey === "on_hold") {
+    // Checked before the optional branches below, which would otherwise sweep
+    // an optional task (iron, nitrogen boost) into "Optional" and leave it
+    // advertising itself as available right through the lockout.
     section = meta.section;
   } else if (!task.optional) {
     section = meta.section;
@@ -2612,10 +2792,16 @@ class LawnMaintenanceCard extends HTMLElement {
     // through to the normal "logs" bucket like any other section.
     const pinnedRows = [];
 
+    // Off the FULL configured list, not this._categoryTasks(): a lockout's
+    // scope is decided by the source task's own category, so it has to be
+    // found even while a different category is on screen. Nothing leaks —
+    // lockoutSilences() still refuses to reach outside that scope.
+    const lockouts = activeLockouts(this._config.tasks, (id) => this._taskState(id), today);
+
     for (const task of this._categoryTasks()) {
       const data = this._taskState(task.id);
       const parentData = task.type === "follow_up" ? this._taskState(task.parent_id) : null;
-      const status = computeTaskStatus(task, data, today, parentData);
+      const status = computeTaskStatus(task, data, today, parentData, lockoutFor(lockouts, task));
       // A follow-up only exists on the list while it is actually outstanding:
       // once logged (or before its parent has ever been done) it drops out of
       // the actionable list entirely, its record living on in history.
@@ -3990,8 +4176,33 @@ function compactEntryDetail(task, entry) {
 //
 // Deliberately at most ONE upcoming marker per task per week, so a two-week
 // seasonal window does not paint the same task across every day of it.
-function upcomingEventFor(task, status, today) {
+function upcomingEventFor(task, status, today, lockouts) {
   const optional = !!task.optional;
+
+  // A task running a lockout paints one marker per day for the whole period,
+  // the single deliberate exception to the "at most one marker per task per
+  // week" rule above. Without it the establishment period would read as an
+  // absence — an oddly empty calendar — instead of something you can count
+  // your way through. buildWeekEvents drops whichever days fall outside the
+  // visible window, so emitting the full run here costs nothing.
+  const source = (lockouts || []).find((l) => l.sourceId === task.id);
+  if (source) {
+    const markers = [];
+    for (let i = 0; i < source.totalDays; i++) {
+      const date = addDays(source.start, i);
+      markers.push({
+        date,
+        detail: `Day ${i + 1} of ${source.totalDays}`,
+        statusKey: "lockout_day",
+      });
+    }
+    return markers;
+  }
+
+  // Silenced by someone else's lockout: contributes nothing to look forward
+  // to. computeTaskStatus already decided this (status.lockedOut), so the
+  // calendar and the task list can never disagree about who is held.
+  if (status.lockedOut) return null;
 
   if (task.type === "log") {
     // Purely informational, and only when the task configures a target AND
@@ -4100,6 +4311,11 @@ function buildWeekEvents(tasks, dataFor, weekStart, today) {
   }
   const byIso = new Map(days.map((d) => [d.iso, d]));
 
+  // Resolved once for the whole strip, off the CONFIGURED tasks: a follow-up
+  // never declares a lockout of its own, and computing this per task would
+  // rescan every task's history for each task drawn.
+  const lockouts = activeLockouts(tasks, dataFor, today);
+
   // Same expansion the planner card uses, so a pending follow-up shows up
   // here too — synthesis lives in withFollowUps(), never duplicated.
   for (const task of withFollowUps(tasks)) {
@@ -4134,7 +4350,8 @@ function buildWeekEvents(tasks, dataFor, weekStart, today) {
     // Most task types contribute at most one upcoming marker; a programme
     // returns one per outstanding target, so normalise to a list here rather
     // than making every other branch return an array.
-    const upcoming = upcomingEventFor(task, computeTaskStatus(task, data, today, parentData), today);
+    const lockout = lockoutFor(lockouts, task);
+    const upcoming = upcomingEventFor(task, computeTaskStatus(task, data, today, parentData, lockout), today, lockouts);
     for (const event of Array.isArray(upcoming) ? upcoming : upcoming ? [upcoming] : []) {
       const day = byIso.get(formatISODate(event.date));
       if (!day) continue;

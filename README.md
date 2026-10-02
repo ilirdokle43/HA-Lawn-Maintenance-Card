@@ -732,6 +732,78 @@ not `last_completed + interval_days`) until you clear it. While active:
 Overdue/due-today/due-soon/upcoming status is still computed normally against
 whichever date — automatic or overridden — is currently in effect.
 
+## Lockouts (establishment periods)
+
+Some jobs make the lawn untouchable for a while afterwards. Overseed it and
+for roughly the next month you must not fertilize, spray or even mow — the
+seedbed is still knitting in. A task declares that with `lockout:`, and from
+the day it is logged until `days` later, everything else in scope stops asking
+to be done.
+
+```yaml
+- id: overseeding
+  name: Overseeding
+  type: seasonal
+  window: { start: "09-24", end: "10-07" }
+  lockout:
+    days: 30
+    label: Overseeding
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `days` | — (required) | How long the period lasts, counted from the logged date, which is day 1. |
+| `scope` | `category` | `category` (the source task's own category), `all`, or a list of task ids. |
+| `exempt` | — | Task ids that carry on as normal. |
+| `label` | the task's name | Wording for the hold text and the daily marker. |
+
+`lockout_days: 30` is shorthand for `lockout: {days: 30}`.
+
+### What it does and does not do
+
+This split is the whole design:
+
+- **Predictions are suppressed.** Due, overdue, "available now", a seasonal
+  window opening, a programme's next target, and a log task's
+  `target_interval_days` nudge all go quiet. Held tasks move into an **On
+  hold** section (collapsed by default) reading *"On hold · Overseeding day 4
+  of 30 · until 29 Oct"*, and stop drawing markers on the week calendar.
+- **History is never touched, and logging never stops.** Every held task keeps
+  its row and stays fully loggable, and anything you actually do still shows
+  as done. That is deliberate: irrigation and lawn-condition logging are
+  exactly what you carry on doing during establishment, and a completed task
+  is a fact, not a prediction.
+
+A lockout never silences the task that started it, and never reaches outside
+its scope — overseeding the lawn says nothing about when the AC filter is due.
+
+### Seeing where you are
+
+The task running the lockout paints a **"Day N of M"** marker on *every* day
+of the period in the week calendar. It is the one deliberate exception to the
+calendar's "at most one upcoming marker per task per week" rule: without it an
+establishment period would read as an absence — an oddly empty strip — instead
+of a countdown you can follow.
+
+### Log tasks are a special case
+
+A `type: log` task has no due/overdue concept to suppress, so it keeps its row,
+its section and its pin. Only two things change: a `target_interval_days` nudge
+stops printing "may be due" and says what is actually happening instead, and
+its target stops appearing on the calendar. Log tasks without a target — the
+usual case for irrigation, rainfall and lawn condition — are completely
+unaffected, because they never predicted anything in the first place.
+
+### Ending a hold early
+
+Set a `lockout_until` field (a `YYYY-MM-DD` date) on the logged entry and it
+overrides `days`. This rides on the per-entry `fields` that
+`pyscript.lawn_edit_history_entry` already stores, so no backend change is
+needed — see [How history is stored](#how-history-is-stored-read-this-first).
+
+Only the **most recent** entry of a lockout task can be running one, so last
+year's overseeding never re-arms this year's.
+
 ## How seasonal windows work
 
 A seasonal task has one recommended application window per year
