@@ -2297,7 +2297,26 @@ class LawnMaintenanceCard extends HTMLElement {
       // Conservative: no history at all (new entity, recorder disabled/short
       // retention) means we can't confirm the full window, so treat as not
       // met rather than optimistically active.
-      durationMet = points.length > 0 && points.every((p) => advisoryConditionMet(Number(p.state), advisory));
+      //
+      // Checking the VALUES is not enough on its own — the window also has to
+      // actually be covered. include_start_time_state seeds a point at the
+      // window start only for an entity that already existed then; a sensor
+      // added recently, or one whose rows have been purged, simply returns
+      // fewer points, and every() over those would happily report that a
+      // 5-day condition had held after two days of data. Require the first
+      // point to sit at (or before) the window start, with a small tolerance
+      // for the gap between a recorder write and the exact boundary.
+      const COVERAGE_TOLERANCE_MS = 10 * 60 * 1000;
+      // No `|| 0` fallback: epoch 0 sits far before the window start and
+      // would read as perfect coverage. A point we cannot date is a point we
+      // cannot verify, so it leaves firstTs NaN and the window uncovered.
+      const firstStamp = points.length ? points[0].last_changed || points[0].last_updated : null;
+      const firstTs = firstStamp ? new Date(firstStamp).getTime() : NaN;
+      const windowCovered = Number.isFinite(firstTs) && firstTs <= start.getTime() + COVERAGE_TOLERANCE_MS;
+      durationMet =
+        points.length > 0 &&
+        windowCovered &&
+        points.every((p) => advisoryConditionMet(Number(p.state), advisory));
     } catch (err) {
       error = err;
     }

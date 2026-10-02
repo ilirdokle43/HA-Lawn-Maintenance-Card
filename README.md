@@ -528,6 +528,21 @@ integration enabled (on by default) with retention covering
 new entity), the advisory conservatively stays inactive rather than
 guessing.
 
+**The entity must be at least `duration_hours` old.** The check requires the
+returned history to actually *span* the window, not merely to contain
+readings that all satisfy the condition. Without that, a sensor added two
+days ago would report that a five-day condition had held — every point it
+has ever recorded satisfies the condition, because there are only two days
+of them. Home Assistant seeds a point at the window start for an entity that
+existed then (`include_start_time_state`), so a covered window is detectable:
+the first point lands at the start, within a ten-minute tolerance.
+
+In practice Home Assistant tends to return an empty list outright when the
+requested start predates the entity's first recorded state, which the
+`points.length > 0` guard already handles. The coverage check matters for the
+partial cases — a window only half covered because the recorder purged part
+of it, or because the entity was recreated mid-window.
+
 An advisory **never affects status, sorting, or Needs Attention** — an
 optional task with an active advisory stays exactly where it already was
 (e.g. in Optional), it just gains an extra informational block. Works
